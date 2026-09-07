@@ -6,6 +6,7 @@ from .published_product_registry import record_published_product, find_published
 from .already_posted_adapter import activate_blog_scope
 from .blog_target import require_target_blog_id, write_url, assert_editor_target
 from .blog_tag_policy import tag_requirement_reason
+from .blog_link_policy import affiliate_policy, affiliate_requirement_reason
 try:
  from selenium import webdriver
  from selenium.webdriver.common.by import By
@@ -2839,6 +2840,7 @@ def _ensure_post_artifact(con,row):
 
 def _eligible_rows(con,mode,context=None):
  context=dict(context or {});where=["COALESCE(status,'') NOT LIKE '추천제외:%'","COALESCE(already_posted,0)=0"];params=[]
+ policy=affiliate_policy(context)
  batch_id=str(context.get("import_batch_id") or "").strip()
  image_state=str(context.get("import_image_state") or "").strip()
  if batch_id:
@@ -2846,6 +2848,7 @@ def _eligible_rows(con,mode,context=None):
  if image_state:
   where.append("COALESCE(import_image_state,'')=?");params.append(image_state)
  product_ids=[int(x) for x in (context.get("product_ids") or []) if str(x).isdigit()]
+ if "product_ids" in context and not product_ids:return [],[]
  if product_ids:
   where.append("id IN ("+",".join("?" for _ in product_ids)+")");params.extend(product_ids)
  rows=con.execute("SELECT * FROM products WHERE "+" AND ".join(where)+" ORDER BY product_no,id",params).fetchall()
@@ -2854,6 +2857,8 @@ def _eligible_rows(con,mode,context=None):
   reasons=[];images=_physical_images(row)
   if not row["title"] or not row["body"] or not row["tags"]:reasons.append("원고 미완료")
   elif tag_requirement_reason(row):reasons.append(tag_requirement_reason(row))
+  link_reason=affiliate_requirement_reason(row,policy)
+  if link_reason:reasons.append(link_reason)
   post=None
   if not reasons:
    post,recovery_reason=_ensure_post_artifact(con,row)
@@ -3171,6 +3176,7 @@ def _write_one_post(d,r,mode):
 def _run_v782_modern(context=None,progress=None):
  target=require_target_blog_id();activate_blog_scope()
  ctx=dict(context or {});mode=str(ctx.get("mode") or settings().get("blog_default_mode","images_only"))
+ if affiliate_policy(ctx)!="existing":return run(context=ctx,progress=progress)
  force_retry=bool(ctx.get("force_retry",False))
  if mode not in {"images_only","price_complete","text_only"}:mode="images_only"
  con=sqlite3.connect(DB);con.row_factory=sqlite3.Row;rows,skipped=_eligible_rows(con,mode,ctx)
@@ -3280,12 +3286,16 @@ def _run_v782_modern(context=None,progress=None):
 # This is deliberately not a function-level compatibility shim.  The exact
 # v7.59 module owns Chrome creation, GoBlogWrite navigation, mainFrame entry,
 # title/body/image/tag typing, draft click/verification, retries and tab lifecycle.
-def _prepare_exact_v759_artifacts():
+def _prepare_exact_v759_artifacts(context=None):
  """Ensure current DB-backed posts have a local post.json before v7.59 scans them."""
  con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
+ policy=affiliate_policy(context)
+ ctx=dict(context or {});product_ids={int(x) for x in (ctx.get("product_ids") or []) if str(x).isdigit()}
  try:
   rows=con.execute("SELECT * FROM products WHERE COALESCE(status,'') NOT LIKE '추천제외:%' AND COALESCE(already_posted,0)=0 ORDER BY product_no,id").fetchall()
   for row in rows:
+   if "product_ids" in ctx and int(row["id"]) not in product_ids:continue
+   if affiliate_requirement_reason(row,policy):continue
    if not _row_value(row,"title","") or not _row_value(row,"body","") or not _row_value(row,"tags",""):
     continue
    try:
@@ -3322,7 +3332,7 @@ def run(context=None,progress=None):
  # The old modern/text_only branch performed a pre-title NBDOM handshake and is
  # the direct cause of the latest "write screen only / no title" regression.
  # Never call _run_v782_modern from a user-facing draft action.
- _prepare_exact_v759_artifacts()
+ _prepare_exact_v759_artifacts(ctx)
  from . import blog_adapter_v759_exact as exact
  importlib.invalidate_caches()
  exact=importlib.reload(exact)

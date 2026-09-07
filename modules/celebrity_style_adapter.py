@@ -14,6 +14,8 @@ v8.08.44 design goals
 from pathlib import Path
 import base64, csv, email.utils, hashlib, html, json, math, os, re, sqlite3, time, urllib.parse, urllib.request
 from datetime import datetime, timedelta, timezone
+from collections.abc import Callable
+from .celebrity_source import current_source, source_sql
 
 from .common import ROOT, DATA, DB, OUTPUTS, EVIDENCE, settings, log, clean_listing_title_noise, marketplace_product_accept
 from . import content_adapter, ollama_local, naver_shopping_api, coupang_partners_api, chrome_collector
@@ -89,8 +91,7 @@ def _source_weight(url,source_type=""):
     # A single source may authorize an exact-claim only when it is a known
     # high-authority entertainment/newsroom or a clearly official brand/company
     # domain.  A generic news result is useful evidence, but not enough by itself.
-    if any(x in h for x in ("dispatch.co.kr","osen.co.kr","newsen.com","starnews.co.kr","sportschosun.com","mk.co.kr","yna.co.kr","news1.kr","edaily.co.kr","xportsnews.com","tenasia.com","isplus.com")):return 1.0
-    if any(x in h for x in ("official","brand","company")):return .96
+    if any(h==x or h.endswith("."+x) for x in ("dispatch.co.kr","osen.co.kr","newsen.com","starnews.co.kr","sportschosun.com","mk.co.kr","yna.co.kr","news1.kr","edaily.co.kr","xportsnews.com","tenasia.com","isplus.com")):return 1.0
     if source_type=="news":return .82
     if source_type=="blog":return .58
     if source_type=="google":return .62
@@ -196,9 +197,10 @@ def health():
         return {"ready":True,"name":"왈라랜드 착장","message":f"공개 원문 수집 · API 키 불필요 · 저장 {counts['cached']}/{counts['total']}건"}
     init_schema();cid,sec=_naver_creds();cfg=settings()
     text=ollama_local.status(cfg)
-    return {"ready":bool(cid and sec) or bool(cfg.get("celebrity_style_google_fallback",True)),
+    google=current_source()=="google"
+    return {"ready":google or bool(cid and sec),
             "name":"연예인 착장 트렌드",
-            "message":("NAVER API HUB 뉴스/블로그/이미지 READY" if cid and sec else "NAVER API 미설정 · Google 일반 Chrome fallback 사용")+
+            "message":("Google Chrome 수집 확장프로그램 연결 필요" if google else ("NAVER API HUB 뉴스/블로그/이미지 READY" if cid and sec else "NAVER API HUB 키 설정 필요"))+
                       (" · Ollama READY" if text.get("ready") else " · Ollama 미준비(휴리스틱 fallback)")}
 
 
@@ -255,21 +257,25 @@ def _group_candidates(rows,manual_name=""):
     for cand in ai:
         name=_clean(cand.get("celebrity"));idxs=[]
         for x in cand.get("source_indices") or []:
-            try:i=int(x)
-            except Exception:continue
-            if 0<=i<len(rows):idxs.append(i);used.add(i)
-        if manual_name and manual_name.casefold() not in name.casefold():continue
+            if type(x) is not int:continue
+            if 0<=x<len(rows) and x not in idxs:idxs.append(x)
+        if manual_name and manual_name.casefold()!=name.casefold():continue
         if not name or not idxs:continue
-        sources=[rows[i] for i in idxs]
-        text=" ".join((s.get("title") or "")+" "+(s.get("description") or "") for s in sources)
-        if not OUTFIT_TERMS.search(text) or NEGATIVE_DISCOVERY.search(text):continue
-        ev=_clean(cand.get("event_type")) or _event_type(text)
-        groups.append({"celebrity":name,"event_type":ev,"event_name":_clean(cand.get("event_name")) or ev,"sources":sources})
+        for i in idxs:
+            source=rows[i];text=(source.get("title") or "")+" "+(source.get("description") or "")
+            if name.casefold() not in text.casefold() or not OUTFIT_TERMS.search(text) or NEGATIVE_DISCOVERY.search(text):continue
+            ev=_event_type(text);date=_date_from_pub(source.get("pub_date"))
+            hit=next((g for g in groups if date and g["celebrity"]==name and g["event_type"]==ev
+                      and _date_from_pub(g["sources"][0].get("pub_date"))==date),None)
+            if hit:hit["sources"].append(source)
+            else:groups.append({"celebrity":name,"event_type":ev,"event_name":ev,"sources":[source]})
+            used.add(i)
     # Conservative heuristic fallback for search results AI did not claim.
     for i,r in enumerate(rows):
         if i in used:continue
         text=(r.get("title") or "")+" "+(r.get("description") or "")
         if not OUTFIT_TERMS.search(text) or NEGATIVE_DISCOVERY.search(text):continue
+        if manual_name and manual_name.casefold() not in text.casefold():continue
         name=manual_name.strip() if manual_name.strip() and manual_name.strip() in text else _heuristic_celeb_name(r.get("title"),r.get("description"))
         if not name:continue
         ev=_event_type(text)
@@ -278,7 +284,7 @@ def _group_candidates(rows,manual_name=""):
         hit=None
         for g in groups:
             gd=_date_from_pub((g.get("sources") or [{}])[0].get("pub_date"))
-            if g["celebrity"]==name and g["event_type"]==ev and str(gd or "")==dstr:hit=g;break
+            if d and g["celebrity"]==name and g["event_type"]==ev and str(gd or "")==dstr:hit=g;break
         if hit:hit["sources"].append(r)
         else:groups.append({"celebrity":name,"event_type":ev,"event_name":ev,"sources":[r]})
     return groups
@@ -298,7 +304,7 @@ def _candidate_score(name,event,sources,days):
 
 
 def _wala_enabled() -> bool:
-    return settings().get("celebrity_style_source", "wala") == "wala"
+    return current_source() == "wala"
 
 
 def collect_latest(days=None,celebrity="",progress=None,stop_check=None,max_articles=50):
@@ -308,7 +314,8 @@ def collect_latest(days=None,celebrity="",progress=None,stop_check=None,max_arti
         result=wala_sync.collect_latest(days=int(days or 0),celebrity=celebrity,progress=progress,stop_check=stop_check,max_articles=max_articles)
         _write_candidates_csv()
         return result
-    init_schema();cfg=settings();days=max(1,min(30,int(days or cfg.get("celebrity_style_period_days",3))))
+    init_schema();cfg=settings();days=max(0,int(cfg.get("celebrity_style_period_days",3) if days is None else days))
+    limit=max(1,int(max_articles));stopped=False
     manual=_clean(celebrity);queries=[]
     if manual:
         suffixes=cfg.get("celebrity_style_manual_query_suffixes") or ["공항패션","착장 패션","브랜드 행사 패션","시사회 패션","사복 데일리룩"]
@@ -316,35 +323,32 @@ def collect_latest(days=None,celebrity="",progress=None,stop_check=None,max_arti
     else:
         queries=list(cfg.get("celebrity_style_queries") or ["연예인 공항패션","아이돌 공항패션","연예인 브랜드 행사 패션","연예인 시사회 패션","연예인 제작발표회 패션","연예인 사복 데일리룩","연예인 출근길 패션"])
     maxq=max(1,int(cfg.get("celebrity_style_query_count",8)));queries=queries[:maxq]
-    rows=[];seen=set();errors=[];total=max(1,len(queries)*2);done=0
-    cutoff=_today_kst()-timedelta(days=days)
+    rows=[];seen=set();errors=[];kinds=("google",) if current_source()=="google" else ("news","blog");total=max(1,len(queries)*len(kinds));done=0
+    cutoff=_today_kst()-timedelta(days=days) if days else None
     for q in queries:
-        for kind in ("news","blog"):
+        if stop_check and stop_check():stopped=True;break
+        for kind in kinds:
+            if stop_check and stop_check():stopped=True;break
             done+=1
             if progress:progress(done,total,f"착장 검색 · {kind} · {q}")
-            if not bool(cfg.get("celebrity_style_use_naver_"+kind,True)):continue
-            try:found=_naver_search(kind,q,int(cfg.get("celebrity_style_results_per_query",35)),"date")
-            except Exception as exc:errors.append(f"NAVER {kind} {q}: {exc}");continue
+            try:
+                if kind=="google":
+                    found,gerr=_google_sources(q,int(cfg.get("celebrity_style_google_result_limit",12)));errors.extend(gerr)
+                else:
+                    if not bool(cfg.get("celebrity_style_use_naver_"+kind,True)):continue
+                    found=_naver_search(kind,q,int(cfg.get("celebrity_style_results_per_query",35)),"date")
+            except Exception as exc:errors.append(f"{kind} {q}: {exc}");continue
             for r in found:
                 d=_date_from_pub(r.get("pub_date"))
-                if d and d<cutoff:continue
+                if cutoff and d and d<cutoff:continue
                 key=(r.get("url") or r.get("naver_url") or "")+"|"+(r.get("title") or "")
                 if key in seen:continue
                 seen.add(key);r["query_used"]=q;rows.append(r)
-    # If NAVER is unavailable/too sparse, use existing logged-in normal Chrome Google resolver.
-    min_rows=int(cfg.get("celebrity_style_google_fallback_min_rows",12))
-    if bool(cfg.get("celebrity_style_google_fallback",True)) and len(rows)<min_rows:
-        fallback_queries=queries[:max(1,int(cfg.get("celebrity_style_google_query_count",2)))]
-        for q in fallback_queries:
-            if progress:progress(done,total,f"Google 보강 · {q}")
-            gres,gerr=_google_sources(q,int(cfg.get("celebrity_style_google_result_limit",12)));errors.extend(gerr)
-            for r in gres:
-                key=(r.get("url") or "")+"|"+(r.get("title") or "")
-                if key in seen:continue
-                seen.add(key);r["query_used"]=q;rows.append(r)
-    groups=_group_candidates(rows,manual)
+    stopped=stopped or bool(stop_check and stop_check())
+    groups=[] if stopped else _group_candidates(rows,manual)
     con=sqlite3.connect(DB);con.row_factory=sqlite3.Row;now=_now();saved=0;saved_ids=[]
-    for g in groups:
+    for g in groups[:limit]:
+        if stop_check and stop_check():stopped=True;break
         sources=[];source_seen=set()
         for s in g["sources"]:
             k=s.get("url") or s.get("naver_url") or s.get("title")
@@ -359,7 +363,7 @@ def collect_latest(days=None,celebrity="",progress=None,stop_check=None,max_arti
         score,indep,fresh=_candidate_score(g["celebrity"],g["event_type"],sources,days)
         undated_key=hashlib.sha1("|".join(str(s.get("url") or s.get("title") or "") for s in sources[:3]).encode("utf-8")).hexdigest()[:12]
         fp_date=event_date or ("undated-"+undated_key)
-        fp=hashlib.sha1((g["celebrity"]+"|"+g["event_type"]+"|"+fp_date).encode("utf-8")).hexdigest()
+        fp="search:"+current_source()+":"+hashlib.sha1((g["celebrity"]+"|"+g["event_type"]+"|"+fp_date).encode("utf-8")).hexdigest()
         summary=" / ".join(_clean(s.get("title")) for s in sources[:3])[:1200]
         con.execute("""INSERT INTO celebrity_style_candidates
           (fingerprint,celebrity_name,event_name,event_date,look_type,query_text,discovered_at,updated_at,source_count,independent_source_count,freshness_score,evidence_score,confidence_score,confidence_label,status,summary,source_json,last_error)
@@ -374,7 +378,8 @@ def collect_latest(days=None,celebrity="",progress=None,stop_check=None,max_arti
         if rid:saved_ids.append(int(rid[0]))
         saved+=1
     con.commit();con.close();_write_candidates_csv()
-    return {"count":saved,"candidate_ids":list(dict.fromkeys(saved_ids)),"raw_sources":len(rows),"errors":errors,"message":f"최근 {days}일 착장 후보 {saved}건 · 원천 {len(rows)}건 수집"}
+    period=f"최근 {days}일" if days else "전체 기간"
+    return {"count":saved,"candidate_ids":list(dict.fromkeys(saved_ids)),"raw_sources":len(rows),"errors":errors,"stopped":stopped,"message":f"{period} 착장 후보 {saved}건 · 원천 {len(rows)}건 수집"+(" · 중지됨" if stopped else "")}
 
 
 def _candidate_sources(row):return _safe_json(row["source_json"] if isinstance(row,sqlite3.Row) else row.get("source_json"),[])
@@ -455,11 +460,13 @@ def _google_image_sources(query,limit=12):
     return rows,errors
 
 
-def _collect_outfit_reference_images(row,sources):
+def _collect_outfit_reference_images(row,sources,stop_check: Callable[[], bool] | None = None):
+    from .wala_images import ReferenceImage, ReferenceState
+    row=dict(row)
     if str(row["fingerprint"]).startswith("wala:"):
         from .wala_images import reference_images
-        return reference_images(row,sources)
-    cfg=settings();state={"queries":[],"candidates":[],"downloaded":[],"errors":[]}
+        return reference_images(row,sources,stop_check)
+    cfg=settings();state: ReferenceState={"queries":[],"candidates":[],"downloaded":[],"errors":[],"stopped":False}
     celeb=str(row.get("celebrity_name") or "").strip();look=str(row.get("look_type") or "패션화제").strip();eday=str(row.get("event_date") or "").strip()
     if not celeb:return state
     hints=OUTFIT_EVENT_QUERY_HINTS.get(look,[look or "착장"])
@@ -470,30 +477,34 @@ def _collect_outfit_reference_images(row,sources):
     queries=list(dict.fromkeys(q for q in queries if q.strip()))[:max(1,int(cfg.get("celebrity_style_reference_query_count",4)))]
     state["queries"]=queries
     evidence_hosts={_independent_host(s.get("url")) for s in sources if _independent_host(s.get("url"))}
-    candidates=[];seen=set()
+    candidates: list[ReferenceImage]=[];seen=set()
     for q in queries:
-        try:nrows=_naver_search("image",q,int(cfg.get("celebrity_style_reference_search_images",18)),"sim")
+        if stop_check and stop_check():state["stopped"]=True;break
+        try:nrows=_naver_search("image",q,int(cfg.get("celebrity_style_reference_search_images",18)),"sim") if current_source()=="naver" else []
         except Exception as exc:state["errors"].append(f"NAVER image {q}: {exc}");nrows=[]
         for r in nrows:
             title=_clean(r.get("title"));score=_outfit_reference_score(title,"",row,"",evidence_hosts)
+            if celeb.casefold() not in title.casefold():continue
             if score<int(cfg.get("celebrity_style_reference_min_text_score",7)):continue
             iu=str(r.get("image_url") or "").strip()
             if not iu or iu in seen:continue
-            seen.add(iu);candidates.append({"title":title,"description":"","image_url":iu,"page_url":"","host":"","source_type":"naver_image","score":score})
-        if bool(cfg.get("celebrity_style_google_fallback",True)) and len(candidates)<int(cfg.get("celebrity_style_reference_min_candidates",6)):
+            seen.add(iu);candidates.append({"title":title,"description":"","image_url":iu,"page_url":"","host":"","source_type":"naver_image","score":score,"file":""})
+        if current_source()=="google":
             grows,gerrs=_google_image_sources(q,int(cfg.get("celebrity_style_google_image_result_limit",12)));state["errors"].extend(gerrs)
             for r in grows:
                 host=str(r.get("host") or "").lower()
                 if any(bad in host for bad in OUTFIT_IMAGE_BAD_HOSTS):continue
                 title=_clean(r.get("title"));desc=_clean(r.get("description"));score=_outfit_reference_score(title,desc,row,host,evidence_hosts)
+                if celeb.casefold() not in (title+" "+desc).casefold():continue
                 if score<int(cfg.get("celebrity_style_reference_min_text_score",7)):continue
                 iu=str(r.get("image_url") or "").strip()
                 if not iu or iu in seen:continue
-                seen.add(iu);candidates.append({**r,"score":score})
+                seen.add(iu);candidates.append({"title":title,"description":desc,"image_url":iu,"page_url":str(r.get("page_url") or ""),"host":host,"source_type":"google_image","score":score,"file":""})
     candidates.sort(key=lambda x:(-float(x.get("score") or 0),x.get("source_type")!="naver_image"));state["candidates"]=candidates[:24]
     work=EVIDENCE/"celebrity_style"/str(row["id"])/"references";hashes=set();max_img=max(2,int(cfg.get("celebrity_style_reference_max_images",5)))
     min_dim=max(240,int(cfg.get("celebrity_style_reference_image_min_dimension",300)))
     for idx,c in enumerate(candidates[:24],1):
+        if stop_check and stop_check():state["stopped"]=True;break
         p=work/f"ref_{idx}.jpg"
         if not _download_temp_image(c.get("image_url") or "",p,referer=c.get("page_url") or "",min_dim=min_dim,
                                     max_ratio=float(cfg.get("celebrity_style_reference_max_aspect_ratio",2.8))):continue
@@ -519,13 +530,14 @@ def _ollama_vision_json(image_paths,prompt,model):
     return content_adapter._extract_json_response((obj.get("message") or {}).get("content") or "")
 
 
-def _vision_analyze(row,sources):
+def _vision_analyze(row,sources,stop_check: Callable[[], bool] | None = None):
     cfg=settings();state={"attempted":False,"model":"","images":[],"result":{},"errors":[],"reference_search":{},"cluster_result":{}}
     if not bool(cfg.get("celebrity_style_vision_enabled",True)):return state
     model=_vision_model(cfg)
     if not model:return state
     state["attempted"]=True;state["model"]=model
-    ref=_collect_outfit_reference_images(row,sources);state["reference_search"]=ref
+    ref=_collect_outfit_reference_images(row,sources,stop_check);state["reference_search"]=dict(ref)
+    if stop_check and stop_check():return state
     downloaded=list(ref.get("downloaded") or []);paths=[Path(x["file"]) for x in downloaded if x.get("file")]
     if not paths:state["errors"].append("착장 전용 참고 이미지를 확보하지 못했습니다.");return state
 
@@ -572,18 +584,20 @@ def collect_reference_images(candidate_ids=None,progress=None,stop_check=None):
         from . import wala_processing
         return wala_processing.collect_reference_images(candidate_ids,progress,stop_check)
     init_schema();con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
-    where="WHERE 1=1";params=[]
+    where="WHERE "+source_sql();params=[]
     ids=[int(x) for x in (candidate_ids or []) if str(x).isdigit()]
+    if candidate_ids is not None and not ids:where+=" AND 0"
     if ids:where+=" AND id IN ("+",".join("?" for _ in ids)+")";params.extend(ids)
     rows=con.execute("SELECT * FROM celebrity_style_candidates "+where+" ORDER BY event_date DESC,confidence_score DESC LIMIT 80",params).fetchall();count=0;images=0
     for idx,row in enumerate(rows):
+        if stop_check and stop_check():break
         if progress:progress(idx,len(rows),f"착장 관련 이미지 · {row['celebrity_name']} · {row['look_type']}")
-        ref=_collect_outfit_reference_images(row,_candidate_sources(row));images+=len(ref.get("downloaded") or [])
+        ref=_collect_outfit_reference_images(row,_candidate_sources(row),stop_check);images+=len(ref.get("downloaded") or [])
         old=_safe_json(row["vision_json"],{});old["reference_search"]=ref;old["reference_only_collected_at"]=_now()
         con.execute("UPDATE celebrity_style_candidates SET vision_json=?,updated_at=? WHERE id=?",(json.dumps(old,ensure_ascii=False),_now(),row["id"]));con.commit();count+=1
     con.close();_write_candidates_csv()
     if progress:progress(len(rows),len(rows) or 1,"착장 관련 이미지 수집 완료")
-    return {"processed":count,"images":images,"message":f"착장 관련 참고이미지 {images}장 · 후보 {count}건 수집 완료"}
+    return {"processed":count,"images":images,"stopped":bool(stop_check and stop_check()),"message":f"착장 관련 참고이미지 {images}장 · 후보 {count}건 수집 완료"}
 
 def _ai_extract_items(row,sources,page_texts,vision):
     cfg=settings();evidence=[]
@@ -609,12 +623,15 @@ Vision보조={json.dumps((vision or {}).get('result') or {},ensure_ascii=False)}
         log("착장 아이템 AI 분석 실패: "+str(exc));return {"items":[],"summary":""}
 
 
-def _item_confidence(item,sources):
+def _item_confidence(item,sources,page_texts=None):
     idxs=[]
+    brand_text=_clean(item.get("brand")).casefold();model_text=_clean(item.get("model_name")).casefold()
+    fulltext={str(p.get("url") or ""):_clean(p.get("text")) for p in (page_texts or [])}
     for x in item.get("exact_text_evidence") or []:
-        try:i=int(x)
-        except Exception:continue
-        if 0<=i<len(sources):idxs.append(i)
+        if type(x) is not int or not 0<=x<len(sources) or x in idxs:continue
+        source=sources[x]
+        text=_clean(str(source.get("title") or "")+" "+str(source.get("description") or "")+" "+fulltext.get(str(source.get("url") or ""),"")).casefold()
+        if brand_text and model_text and all(re.search(r"(?<![0-9A-Za-z])"+re.escape(term)+r"(?![0-9A-Za-z])",text) for term in (brand_text,model_text)):idxs.append(x)
     hosts={_independent_host(sources[i].get("url")) for i in idxs if _independent_host(sources[i].get("url"))}
     brand=bool(_clean(item.get("brand")));model=bool(_clean(item.get("model_name")));level=str(item.get("evidence_level") or "")
     score=18
@@ -625,14 +642,14 @@ def _item_confidence(item,sources):
     if model:score+=18
     if level=="텍스트확정":score+=8
     elif level=="텍스트강함":score+=4
-    exact=bool(item.get("exact_claim_allowed")) and brand and model
+    exact=item.get("exact_claim_allowed") is True and brand and model and bool(idxs)
     # One source is enough only when it is a deliberately high-authority
     # newsroom/official domain. Generic portal news, blogs, and Google results
     # require corroboration from a second independent host.
     if exact and len(hosts)<2:
         auth=max((_source_weight(sources[i].get("url"),sources[i].get("source_type")) for i in idxs),default=0)
         if auth<.95: exact=False;score=min(score,82)
-    return min(100,score),exact,len(hosts)
+    return min(100 if exact else 82,score),exact,len(hosts)
 
 
 def analyze_unfinished(candidate_ids=None,progress=None,stop_check=None):
@@ -640,30 +657,36 @@ def analyze_unfinished(candidate_ids=None,progress=None,stop_check=None):
         from . import wala_processing
         return wala_processing.analyze_unfinished(candidate_ids,progress,stop_check)
     init_schema();con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
-    where="WHERE status NOT IN ('원고완료','작성물연동')";params=[]
+    where="WHERE "+source_sql()+" AND status NOT IN ('원고완료','작성물연동')";params=[]
     ids=[int(x) for x in (candidate_ids or []) if str(x).isdigit()]
+    if candidate_ids is not None and not ids:where+=" AND 0"
     if ids:where+=" AND id IN ("+",".join("?" for _ in ids)+")";params.extend(ids)
     rows=con.execute("SELECT * FROM celebrity_style_candidates "+where+" ORDER BY event_date DESC,confidence_score DESC LIMIT 80",params).fetchall()
     processed=0
     for idx,row in enumerate(rows):
+        if stop_check and stop_check():break
         if progress:progress(idx,len(rows),f"착장 검증 · {row['celebrity_name']} · {row['look_type']}")
         sources=_candidate_sources(row);page_texts=[]
         if bool(settings().get("celebrity_style_fetch_source_pages",True)):
             checks=max(0,int(settings().get("celebrity_style_source_page_checks",2)))
             ranked=sorted(sources,key=lambda s:_source_weight(s.get("url"),s.get("source_type")),reverse=True)
             for s in ranked[:checks]:
+                if stop_check and stop_check():break
                 txt=_fetch_source_page_text(s.get("url") or "",row["celebrity_name"])
                 if txt:page_texts.append({"url":s.get("url"),"text":txt[:8000]})
-        vision=_vision_analyze(row,sources)
+        if stop_check and stop_check():break
+        vision=_vision_analyze(row,sources,stop_check)
+        if stop_check and stop_check():break
         ai=_ai_extract_items(row,sources,page_texts,vision)
+        if stop_check and stop_check():break
         con.execute("DELETE FROM celebrity_style_items WHERE candidate_id=?",(row["id"],))
         item_scores=[]
         for it in ai.get("items") or []:
             if not isinstance(it,dict):continue
             desc=_clean(it.get("description"));brand=_clean(it.get("brand"));model=_clean(it.get("model_name"));cat=_clean(it.get("category")) or "기타"
             if not desc and not brand and not model:continue
-            score,exact,indep=_item_confidence(it,sources);item_scores.append(score)
-            ev={"text_source_indices":it.get("exact_text_evidence") or [],"independent_sources":indep,"notes":it.get("notes") or "","rule":"VISUAL_NEVER_CONFIRMS_BRAND_MODEL"}
+            score,exact,indep=_item_confidence(it,sources,page_texts);item_scores.append(score)
+            ev={"text_source_indices":it.get("exact_text_evidence") or [],"source_page_texts":page_texts,"independent_sources":indep,"notes":it.get("notes") or "","rule":"VISUAL_NEVER_CONFIRMS_BRAND_MODEL"}
             con.execute("""INSERT OR REPLACE INTO celebrity_style_items
               (candidate_id,item_category,item_description,brand,model_name,color,evidence_level,confidence_score,exact_claim_allowed,evidence_json,updated_at)
               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
@@ -677,7 +700,7 @@ def analyze_unfinished(candidate_ids=None,progress=None,stop_check=None):
         con.commit();processed+=1
     con.close();_write_candidates_csv();_write_items_csv()
     if progress:progress(len(rows),len(rows) or 1,"착장 분석 완료")
-    return {"processed":processed,"message":f"착장 근거 분석 {processed}건 완료"}
+    return {"processed":processed,"stopped":bool(stop_check and stop_check()),"message":f"착장 근거 분석 {processed}건 완료"}
 
 
 def _product_target(item):
@@ -711,42 +734,46 @@ def match_products(candidate_ids=None,progress=None,stop_check=None):
         from . import wala_processing
         return wala_processing.match_products(candidate_ids,progress,stop_check)
     init_schema();con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
-    where="WHERE c.status IN ('착장분석완료','상품매칭부분','착장근거부족')";params=[]
+    where="WHERE "+source_sql("c.fingerprint")+" AND c.status IN ('착장분석완료','상품매칭부분','착장근거부족')";params=[]
     ids=[int(x) for x in (candidate_ids or []) if str(x).isdigit()]
+    if candidate_ids is not None and not ids:where+=" AND 0"
     if ids:where+=" AND c.id IN ("+",".join("?" for _ in ids)+")";params.extend(ids)
     items=con.execute("SELECT i.*,c.celebrity_name,c.look_type FROM celebrity_style_items i JOIN celebrity_style_candidates c ON c.id=i.candidate_id "+where+" ORDER BY c.confidence_score DESC,i.confidence_score DESC",params).fetchall()
-    matched=0
+    matched=0;processed=0;cand_ids=set()
     for idx,it in enumerate(items):
+        if stop_check and stop_check():break
         if progress:progress(idx,len(items),f"상품 검증 · {it['celebrity_name']} · {it['item_category']}")
         target=_product_target(it);nav=None;cp=None;match_type="미확인";exact_allowed=bool(it["exact_claim_allowed"]);chosen=None
         if target and exact_allowed:
             try:nav,_errs=naver_shopping_api.best_exact_match(target,max_queries=3,threshold=.58)
             except Exception:nav=None
-            try:cp=coupang_partners_api.best_exact_match(target,max_queries=3,threshold=.58)
+            if stop_check and stop_check():break
+            try:cp,_errs=coupang_partners_api.best_exact_match(target,max_queries=3,threshold=.58)
             except Exception:cp=None
             # Exact identity always beats affiliate availability. Never replace a NAVER-exact item
             # with a merely similar Coupang item while keeping an exact label.
             if cp:match_type="정확상품";chosen=cp
             elif nav:match_type="정확상품(네이버검증)";chosen=nav
+        if stop_check and stop_check():break
         if chosen is None:
             sq=_similar_query(it)
             sim=_best_similar_coupang(sq)
             if sim:
                 cp=sim;chosen=sim;match_type="유사스타일"
+        if stop_check and stop_check():break
         if chosen:
             matched+=1
             con.execute("""UPDATE celebrity_style_items SET naver_product_json=?,coupang_product_json=?,matched_name=?,matched_url=?,matched_price=?,matched_image_url=?,match_type=?,updated_at=? WHERE id=?""",
              (json.dumps(nav or {},ensure_ascii=False),json.dumps(cp or {},ensure_ascii=False),_clean(chosen.get("name")),str(chosen.get("url") or ""),int(chosen.get("price") or 0),str(chosen.get("image_url") or ""),match_type,_now(),it["id"]))
         else:
-            con.execute("UPDATE celebrity_style_items SET match_type='미확인',updated_at=? WHERE id=?",(_now(),it["id"]))
-        con.commit()
-    cand_ids={int(x["candidate_id"]) for x in items}
+            con.execute("UPDATE celebrity_style_items SET match_type='미확인',matched_name='',matched_url='',matched_price=0,matched_image_url='',naver_product_json='{}',coupang_product_json='{}',updated_at=? WHERE id=?",(_now(),it["id"]))
+        con.commit();processed+=1;cand_ids.add(int(it["candidate_id"]))
     for cid in cand_ids:
         cnt=con.execute("SELECT COUNT(*) FROM celebrity_style_items WHERE candidate_id=? AND matched_name<>''",(cid,)).fetchone()[0]
         con.execute("UPDATE celebrity_style_candidates SET status=?,updated_at=? WHERE id=?",("상품매칭완료" if cnt else "상품매칭부분",_now(),cid))
     con.commit();con.close();_write_items_csv();_write_candidates_csv()
     if progress:progress(len(items),len(items) or 1,"상품 검증 완료")
-    return {"processed":len(items),"matched":matched,"message":f"착장 아이템 {len(items)}개 검증 · 상품 연결 {matched}개"}
+    return {"processed":processed,"matched":matched,"stopped":bool(stop_check and stop_check()),"message":f"착장 아이템 {processed}개 검증 · 상품 연결 {matched}개"}
 
 
 def _draft_prompt(row,items,sources):
@@ -817,11 +844,13 @@ def generate_drafts(candidate_ids=None,progress=None,stop_check=None):
         from . import wala_drafts
         return wala_drafts.generate_drafts(candidate_ids,progress,stop_check)
     init_schema();cfg=settings();con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
-    where="WHERE status IN ('착장분석완료','상품매칭완료','상품매칭부분','착장근거부족')";params=[]
+    where="WHERE "+source_sql()+" AND status IN ('착장분석완료','상품매칭완료','상품매칭부분','착장근거부족')";params=[]
     ids=[int(x) for x in (candidate_ids or []) if str(x).isdigit()]
+    if candidate_ids is not None and not ids:where+=" AND 0"
     if ids:where+=" AND id IN ("+",".join("?" for _ in ids)+")";params.extend(ids)
     rows=con.execute("SELECT * FROM celebrity_style_candidates "+where+" ORDER BY event_date DESC,confidence_score DESC LIMIT 80",params).fetchall();made=0
     for idx,row in enumerate(rows):
+        if stop_check and stop_check():break
         if progress:progress(idx,len(rows),f"착장 원고 생성 · {row['celebrity_name']} · {row['look_type']}")
         items=con.execute("SELECT * FROM celebrity_style_items WHERE candidate_id=? ORDER BY confidence_score DESC,id",(row["id"],)).fetchall();sources=_candidate_sources(row)
         try:
@@ -829,6 +858,7 @@ def generate_drafts(candidate_ids=None,progress=None,stop_check=None):
         except Exception as exc:
             log("착장 원고 Ollama fallback: "+str(exc));obj=_fallback_draft(row,items)
         if not isinstance(obj,dict):obj=_fallback_draft(row,items)
+        if stop_check and stop_check():break
         title=_clean(obj.get("title"))[:70] or _fallback_draft(row,items)["title"]
         tags=[];seen=set()
         for t in obj.get("tags") or []:
@@ -844,7 +874,7 @@ def generate_drafts(candidate_ids=None,progress=None,stop_check=None):
                     (title,body,",".join(tags[:30]),_now(),row["id"]));con.commit();made+=1
     con.close();_write_candidates_csv()
     if progress:progress(len(rows),len(rows) or 1,"착장 원고 생성 완료")
-    return {"processed":made,"message":f"연예인 착장 원고 {made}건 생성 완료"}
+    return {"processed":made,"stopped":bool(stop_check and stop_check()),"message":f"연예인 착장 원고 {made}건 생성 완료"}
 
 
 def _next_product_no(con):
@@ -852,7 +882,7 @@ def _next_product_no(con):
     except Exception:return 1
 
 
-def promote_candidate(candidate_id):
+def promote_candidate(candidate_id,exact_only: bool = False):
     """Promote one drafted outfit article into the existing product/blog pipeline.
 
     The product identity is the best verified marketplace item, so the existing
@@ -860,29 +890,37 @@ def promote_candidate(candidate_id):
     remains a celebrity-style article and labels similar items as similar.
     """
     init_schema();con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
-    row=con.execute("SELECT * FROM celebrity_style_candidates WHERE id=?",(int(candidate_id),)).fetchone()
+    row=con.execute("SELECT * FROM celebrity_style_candidates WHERE "+source_sql()+" AND id=?",(int(candidate_id),)).fetchone()
     if not row:con.close();raise RuntimeError("착장 후보를 찾지 못했습니다.")
     if not row["draft_title"] or not row["draft_body"] or not row["draft_tags"]:con.close();raise RuntimeError("먼저 착장 블로그 원고를 생성하세요.")
-    item=con.execute("SELECT * FROM celebrity_style_items WHERE candidate_id=? AND COALESCE(matched_name,'')<>'' AND COALESCE(matched_url,'')<>'' ORDER BY CASE WHEN match_type='정확상품' THEN 0 WHEN match_type LIKE '정확상품%' THEN 1 ELSE 2 END, confidence_score DESC LIMIT 1",(row["id"],)).fetchone()
+    exact_filter=" AND exact_claim_allowed=1 AND match_type IN ('정확상품','정확상품(네이버검증)')" if exact_only else ""
+    item=con.execute("SELECT * FROM celebrity_style_items WHERE candidate_id=? AND COALESCE(matched_name,'')<>'' AND COALESCE(matched_url,'')<>''"+exact_filter+" ORDER BY CASE WHEN match_type='정확상품' THEN 0 WHEN match_type LIKE '정확상품%' THEN 1 ELSE 2 END, confidence_score DESC LIMIT 1",(row["id"],)).fetchone()
     if not item:con.close();raise RuntimeError("연결 가능한 상품이 없습니다. 먼저 상품 검증/매칭을 실행하세요.")
-    existing=con.execute("SELECT id FROM products WHERE content_type='celebrity_style' AND celebrity_style_id=? LIMIT 1",(row["id"],)).fetchone()
+    if exact_only:
+        evidence=_safe_json(item["evidence_json"],{})
+        claim={**dict(item),"exact_claim_allowed":bool(item["exact_claim_allowed"]),"exact_text_evidence":evidence.get("text_source_indices") or []}
+        if not _item_confidence(claim,_candidate_sources(row),evidence.get("source_page_texts"))[1]:
+            con.close();raise RuntimeError("원문에 브랜드와 모델이 함께 확인된 정확상품만 자동 연동할 수 있습니다.")
+    host=_independent_host(item["matched_url"])
+    platform="연예인착장·"+current_source()+("·쿠팡" if host=="coupang.com" or host.endswith(".coupang.com") else "")
+    identity=clean_listing_title_noise(item["matched_name"])
+    existing=con.execute("SELECT * FROM products WHERE content_type='celebrity_style' AND celebrity_style_id=? LIMIT 1",(row["id"],)).fetchone()
     if existing:
-        pid=int(existing[0]);con.execute("UPDATE products SET name=?,category=?,source_platform='연예인착장',source_url=?,title=?,body=?,tags=?,status='연예인착장원고완료',updated_at=datetime('now','localtime') WHERE id=?",
-          (item["matched_name"],"패션잡화" if item["item_category"] in {"가방","신발","모자","주얼리/액세서리"} else "패션의류",item["matched_url"],row["draft_title"],row["draft_body"],row["draft_tags"],pid))
+        if existing["already_posted"]:con.close();raise RuntimeError("이미 저장 또는 발행한 착장 상품은 다시 덮어쓰지 않습니다.")
+        pid=int(existing["id"])
+        if existing["name"]!=item["matched_name"] or existing["source_url"]!=item["matched_url"]:
+            con.execute("""UPDATE products SET image1=NULL,image2=NULL,image3=NULL,sharelink='',post_dir=NULL,
+              price_toss=NULL,price_coupang=NULL,price_naver=NULL,price_checked_at=NULL,price_compare_image=NULL,
+              price_evidence_json=NULL,price_verified_sites=0,price_image_verified_sites=0,approved=0,
+              import_image_state=NULL,import_content_state=NULL,last_error=NULL WHERE id=?""",(pid,))
+        con.execute("UPDATE products SET name=?,category=?,product_identity=?,source_platform=?,source_url=?,title=?,body=?,tags=?,status='연예인착장원고완료',updated_at=datetime('now','localtime') WHERE id=?",
+          (item["matched_name"],"패션잡화" if item["item_category"] in {"가방","신발","모자","주얼리/액세서리"} else "패션의류",identity,platform,item["matched_url"],row["draft_title"],row["draft_body"],row["draft_tags"],pid))
     else:
         pno=_next_product_no(con)
         cur=con.execute("""INSERT INTO products(product_no,name,category,product_identity,source_platform,source_url,score,status,title,body,tags,content_type,celebrity_style_id,updated_at)
                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'))""",
-                        (pno,item["matched_name"],"패션잡화" if item["item_category"] in {"가방","신발","모자","주얼리/액세서리"} else "패션의류",clean_listing_title_noise(item["matched_name"]),"연예인착장",item["matched_url"],float(row["confidence_score"] or 0),"연예인착장원고완료",row["draft_title"],row["draft_body"],row["draft_tags"],"celebrity_style",row["id"]))
+                        (pno,item["matched_name"],"패션잡화" if item["item_category"] in {"가방","신발","모자","주얼리/액세서리"} else "패션의류",identity,platform,item["matched_url"],float(row["confidence_score"] or 0),"연예인착장원고완료",row["draft_title"],row["draft_body"],row["draft_tags"],"celebrity_style",row["id"]))
         pid=int(cur.lastrowid)
-    # Prefer a verified/selected Coupang result for affiliate conversion. Similar-style matches remain clearly labelled in article text.
-    try:
-        cp=_safe_json(item["coupang_product_json"],{})
-        if not str(row["fingerprint"]).startswith("wala:") and cp and str(cp.get("url") or "").strip():
-            dl=coupang_partners_api.create_deeplink(str(cp.get("url") or ""),product_id=str(cp.get("product_id") or ""),product_name=str(cp.get("name") or item["matched_name"]))
-            if dl.get("ok"):
-                con.execute("UPDATE products SET sharelink=? WHERE id=?",(str(dl.get("sharelink") or dl.get("shorten_url") or ""),pid))
-    except Exception as exc:log("연예인 착장 Sharelink 생성 보류: "+str(exc))
     if str(row["fingerprint"]).startswith("wala:"):
         con.execute("UPDATE products SET source_platform='왈라랜드',sharelink='' WHERE id=?",(pid,))
     con.execute("UPDATE celebrity_style_candidates SET promoted_product_id=?,status='작성물연동',updated_at=? WHERE id=?",(pid,_now(),row["id"]))
@@ -893,14 +931,14 @@ def promote_candidate(candidate_id):
 def candidate_total() -> int:
     from contextlib import closing
     init_schema()
-    where=" WHERE fingerprint LIKE 'wala:%'" if _wala_enabled() else ""
+    where=" WHERE "+source_sql()
     with closing(sqlite3.connect(DB)) as con:
         return int(con.execute("SELECT COUNT(*) FROM celebrity_style_candidates"+where).fetchone()[0])
 
 
 def candidate_rows(limit=300,offset=0):
     init_schema();con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
-    where=" WHERE fingerprint LIKE 'wala:%'" if _wala_enabled() else ""
+    where=" WHERE "+source_sql()
     rows=con.execute("SELECT * FROM celebrity_style_candidates"+where+" ORDER BY event_date DESC,confidence_score DESC,id DESC LIMIT ? OFFSET ?",(int(limit),max(0,int(offset)))).fetchall();out=[]
     for r in rows:
         d=dict(r);items=con.execute("SELECT * FROM celebrity_style_items WHERE candidate_id=? ORDER BY confidence_score DESC,id",(r["id"],)).fetchall()
@@ -911,7 +949,7 @@ def candidate_rows(limit=300,offset=0):
 
 def candidate_detail(candidate_id):
     init_schema();con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
-    r=con.execute("SELECT * FROM celebrity_style_candidates WHERE id=?",(int(candidate_id),)).fetchone()
+    r=con.execute("SELECT * FROM celebrity_style_candidates WHERE "+source_sql()+" AND id=?",(int(candidate_id),)).fetchone()
     if not r:con.close();return None
     d=dict(r);d["sources"]=_candidate_sources(r);d["vision"]=_safe_json(r["vision_json"],{});d["items"]=[dict(x) for x in con.execute("SELECT * FROM celebrity_style_items WHERE candidate_id=? ORDER BY confidence_score DESC,id",(r["id"],)).fetchall()]
     con.close();return d
@@ -928,7 +966,7 @@ def _write_candidates_csv():
 
 def _write_items_csv():
     OUTPUTS.mkdir(parents=True,exist_ok=True);p=OUTPUTS/"celebrity_style_items.csv";con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
-    where=" WHERE c.fingerprint LIKE 'wala:%'" if _wala_enabled() else ""
+    where=" WHERE "+source_sql("c.fingerprint")
     rows=con.execute("SELECT c.celebrity_name,c.event_date,c.look_type,i.* FROM celebrity_style_items i JOIN celebrity_style_candidates c ON c.id=i.candidate_id"+where+" ORDER BY c.event_date DESC,c.id,i.confidence_score DESC").fetchall();con.close()
     fields=["candidate_id","celebrity_name","event_date","look_type","item_category","item_description","brand","model_name","color","evidence_level","confidence_score","exact_claim_allowed","matched_name","matched_price","match_type","matched_url"]
     with p.open("w",encoding="utf-8-sig",newline="") as f:

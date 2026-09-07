@@ -7,6 +7,8 @@ ROOT=(Path(sys.executable).resolve().parent if getattr(sys,"frozen",False) else 
 from modules.common import *
 from modules import search_adapter,content_adapter,content_text_adapter,image_adapter,price_adapter,blog_adapter,video_adapter,toss_sharelink_pc,market_safe,coupang_safe,chrome_collector,coupang_partners_api,coupang_sharelink_adapter,toss_sharelink_api,naver_shopping_api,trend_collection_adapter,trend_coupang_adapter,celebrity_style_adapter,external_batch_import,already_posted_adapter,workflow_assistant,ollama_local
 from modules import blog_target,blog_tag_policy,collection_preferences,published_product_registry
+from modules import celebrity_dashboard_pipeline
+from modules.celebrity_dashboard_ui import CelebrityDashboardPanel
 RUNTIME_MIGRATION=migrate_previous_install_data()
 init_db()
 STEPS=[
@@ -306,6 +308,9 @@ class App(tk.Tk):
   self.show_page("overview")
 
  def _build_overview_page(self,p):
+  outfits=self._card(p,"연예인 검색 → 착장 원고 · 제휴","Google·네이버에서 인물 사진을 찾아 AI로 착장을 분석합니다.\n확인된 대표 제품의 사진 3장과 쿠팡 제휴링크를 원고에 연결합니다.")
+  outfits.pack(fill="x",pady=(0,12))
+  self.celebrity_dashboard=CelebrityDashboardPanel(outfits,self.celebrity_dashboard_run,lambda:self.celebrity_dashboard_run(True,prepared_only=True))
   grid=tk.Frame(p,bg=self.COLORS["bg"]);grid.pack(fill="x")
   for i in range(5):grid.grid_columnconfigure(i,weight=1)
   metrics=[("전체 상품","overview_total","0"),("원고 준비","overview_content","0"),("사진 3장 완료","overview_images","0"),("임시저장 준비","overview_ready","0"),("게시·저장 이력 제외","overview_posted","0")]
@@ -325,8 +330,9 @@ class App(tk.Tk):
   ttk.Button(quick,text="▶ 검색부터 임시저장까지 전체 실행",style="Accent.TButton",command=self.runall).pack(fill="x",padx=14,pady=(8,5))
   ttk.Button(quick,text="Ollama 제목·본문·태그 생성",style="Soft.TButton",command=lambda:self.single("content")).pack(fill="x",padx=14,pady=4)
   ttk.Button(quick,text="동일상품 사진 3장",style="Soft.TButton",command=lambda:self.single("images")).pack(fill="x",padx=14,pady=4)
-  ttk.Button(quick,text="네이버 저장환경 사전점검",style="Soft.TButton",command=self.blog_preflight).pack(fill="x",padx=14,pady=4)
-  ttk.Button(quick,text="🩺 문제점 검토·자동복구",style="Soft.TButton",command=self.repair).pack(fill="x",padx=14,pady=4)
+  ttk.Button(quick,text="쿠팡 제휴링크 생성 (사진 3장 완료)",style="Soft.TButton",command=self.sharelink_images_only).pack(fill="x",padx=14,pady=4)
+  ttk.Button(quick,text="사진 3장 임시저장 (제휴링크 제외)",style="Accent.TButton",command=lambda:self.blog_single("images_only",blog_context={"affiliate_policy":"omit"})).pack(fill="x",padx=14,pady=4)
+  ttk.Button(quick,text="제휴링크 포함 사진 3장 임시저장",style="Accent.TButton",command=lambda:self.blog_single("images_only",blog_context={"affiliate_policy":"required"})).pack(fill="x",padx=14,pady=4)
   ttk.Button(quick,text="■ 실행 중지",style="Danger.TButton",command=lambda:setattr(self,"stop",True)).pack(fill="x",padx=14,pady=(4,14))
   def _overview_reflow(e):
    w=max(1,int(e.width));cols=5 if w>=1150 else (3 if w>=760 else 2)
@@ -344,6 +350,40 @@ class App(tk.Tk):
     lower.grid_columnconfigure(0,weight=1);lower.grid_columnconfigure(1,weight=0)
     recent.grid(row=0,column=0,sticky="nsew",pady=(0,8));quick.grid(row=1,column=0,sticky="ew")
   p.bind("<Configure>",_overview_reflow,add="+")
+
+ def celebrity_dashboard_run(self,save_draft:bool,prepared_only:bool=False) -> None:
+  if self.worker and self.worker.is_alive():
+   messagebox.showwarning("실행 중","다른 작업이 실행 중입니다.");return
+  panel=self.celebrity_dashboard
+  previous=panel.result if prepared_only else None
+  if prepared_only and (previous is None or not previous.ready_product_ids):
+   messagebox.showwarning("원고 준비 필요","먼저 착장 원고·제휴 준비를 실행하세요.");return
+  try:request=None if prepared_only else panel.request(save_draft)
+  except (ValueError,KeyError):
+   messagebox.showwarning("검색 조건 확인","연예인 이름을 입력하고, 후보 수를 1부터 20까지 선택하세요.");return
+  if save_draft and not blog_target.get_target_blog_id():
+   self.show_page("account");messagebox.showwarning("대상 블로그 설정","임시저장할 네이버 블로그를 먼저 설정하세요.");return
+  source=panel.result_source if request is None else request.source
+  self.stop=False
+  if not prepared_only:panel.clear_result()
+  panel.save_button.configure(state="disabled")
+  panel.status.set("준비된 원고 재검증 중" if prepared_only else "연예인 검색 준비 중")
+  def job():
+   try:
+    def cb(done,total,msg):
+     pct=max(0,min(100,int(float(done)/max(1,float(total))*100)))
+     self.q.put(("celeb_dashboard",pct,msg))
+    if request is not None:
+     result=celebrity_dashboard_pipeline.run(celebrity=request.celebrity,source=request.source,days=request.days,max_articles=request.max_articles,save_draft=request.save_draft,progress=cb,stop_check=lambda:self.stop)
+    elif previous is not None:
+     result=celebrity_dashboard_pipeline.save_prepared(previous.ready_product_ids,progress=cb,stop_check=lambda:self.stop)
+     result=result.model_copy(update={"candidate_ids":previous.candidate_ids})
+    else:return
+    self.q.put(("celeb_dashboard_done",result,source));self.q.put(("refresh",));self.emit("[착장 대시보드] "+result.message)
+   except Exception as exc:
+    self.q.put(("celeb_dashboard",0,"착장 작업 실패: "+str(exc)));self.emit("[착장 대시보드 오류] "+str(exc))
+    if previous is not None:self.q.put(("celeb_dashboard_done",previous.model_copy(update={"stage_ok":False,"message":"착장 작업 실패: "+str(exc)}),source))
+  self.worker=threading.Thread(target=job,daemon=True);self.worker.start()
 
  def _build_account_page(self,p):
   target=self._card(p,"저장할 네이버 블로그","블로그 주소 또는 ID를 저장하세요. 임시저장과 기존 게시글 대조는 이 블로그를 기준으로 실행됩니다.");target.pack(fill="x",pady=(0,12))
@@ -1330,10 +1370,13 @@ class App(tk.Tk):
   def job():
    try:
     self.q.put(("step","content","사진3장 성공 상품 쉐어링크 확인 중",5));self.emit("사진3장 성공 상품만 쿠팡 쉐어링크 생성 시작")
+    self.q.put(("total",0,"사진 3장 검증 완료 상품의 쿠팡 제휴링크 생성 중"))
     result=coupang_sharelink_adapter.run(progress=self.progress("content"),stop_check=lambda:self.stop)
     ok=bool(result.get("stage_ok",True));msg=str(result.get("message") or "쉐어링크 처리 완료")
+    self.q.put(("total",0 if result.get("stopped") else 100,msg))
     self.q.put(("step","content","쉐어링크 완료" if ok else msg,100));self.q.put(("refresh",));self.emit(msg)
    except Exception as e:
+    self.q.put(("total",0,"쿠팡 제휴링크 생성 실패 · 실행 로그 확인"))
     self.q.put(("step","content","쉐어링크 실패",0));self.q.put(("refresh",));self.emit("쉐어링크 실행 실패: "+str(e))
   self.worker=threading.Thread(target=job,daemon=True);self.worker.start()
 
@@ -1717,6 +1760,13 @@ class App(tk.Tk):
      p,m=a;self._set_global_live(stage="연예인 착장",detail=m,pct=p)
      if hasattr(self,"celeb_style_pb"):self.celeb_style_pb["value"]=p
      if hasattr(self,"celeb_style_info"):self.celeb_style_info.set(m)
+    elif typ=="celeb_dashboard":
+     p,m=a;self._set_global_live(stage="연예인 착장",detail=m,pct=p)
+     self.celebrity_dashboard.progress["value"]=p;self.celebrity_dashboard.status.set(m)
+    elif typ=="celeb_dashboard_done":
+     result,source=a;self.celebrity_dashboard.show_result(result,source)
+     pct=100 if result.stage_ok else 0
+     self.celebrity_dashboard.progress["value"]=pct;self._set_global_live(stage="연예인 착장",detail=result.message,pct=pct)
     elif typ=="video":
      p,m=a;self._set_global_live(stage="AI 제품영상",detail=m,pct=p)
      if hasattr(self,"video_pb"):self.video_pb["value"]=p

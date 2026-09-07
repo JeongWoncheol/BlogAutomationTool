@@ -3762,6 +3762,11 @@ def run_images(context=None,progress=None):
             all_rows=list(rows)
             rows=[r for r in all_rows if needs_image_repair(r,want)]
             already_complete=len(all_rows)-len(rows)
+    if isinstance(context,dict) and "product_ids" in context:
+        selected={int(value) for value in (context.get("product_ids") or []) if str(value).isdigit()}
+        rows=[row for row in rows if row["id"] in selected]
+        if not repair_only and not force_recollect:
+            already_complete=sum(1 for row in all_rows if row["id"] in selected and not needs_image_repair(row,want))
     prog=ProgressThrottle(progress);done=0;complete=0;short=[];excluded=[];failed=[];diag_rows=[]
     try:
         with StageTimer("동일상품 사진 전체(직링크 저속 크롭)",f"products={len(rows)}"):

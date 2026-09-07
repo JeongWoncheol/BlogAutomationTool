@@ -6,6 +6,7 @@ from .published_product_registry import record_published_product, find_published
 from .already_posted_adapter import activate_blog_scope
 from .blog_target import require_target_blog_id, write_url, assert_editor_target
 from .blog_tag_policy import tag_requirement_reason
+from .blog_link_policy import AffiliatePolicy, affiliate_policy, affiliate_requirement_reason, prepare_affiliate_post
 try:
  from selenium import webdriver
  from selenium.webdriver.common.by import By
@@ -3911,7 +3912,7 @@ def _resolve_local_file(value,product_no=None,slot=None):
   if len(matches)==1:return matches[0].resolve()
  return None
 
-def _rebase_local_artifacts(con):
+def _rebase_local_artifacts(con,context=None):
  """Repair copied DB absolute paths to the current release before eligibility.
 
  Earlier releases persisted C:\\...\\v7_76/v7_81 paths even though every new ZIP
@@ -3919,7 +3920,10 @@ def _rebase_local_artifacts(con):
  If an older folder is moved/deleted, eligibility becomes 0 and Chrome never
  starts. Rebinding here makes each release self-contained.
  """
+ ctx=dict(context or {})
+ product_ids={int(x) for x in (ctx.get("product_ids") or []) if str(x).isdigit()}
  rows=con.execute("SELECT * FROM products WHERE COALESCE(status,'') NOT LIKE '추천제외:%' ORDER BY product_no,id").fetchall()
+ if "product_ids" in ctx:rows=[row for row in rows if int(row['id']) in product_ids]
  repaired=0;unresolved=[]
  for row in rows:
   updates={};n=row['product_no'] or row['id']
@@ -3952,6 +3956,7 @@ def _rebase_local_artifacts(con):
  con.commit()
  # Read back and report only products that claim 3 photos but still cannot resolve them.
  rows=con.execute("SELECT * FROM products WHERE COALESCE(status,'') NOT LIKE '추천제외:%' ORDER BY product_no,id").fetchall()
+ if "product_ids" in ctx:rows=[row for row in rows if int(row['id']) in product_ids]
  for row in rows:
   claimed=int(row['image_verified_count'] or 0) if 'image_verified_count' in row.keys() else 0
   if claimed>=3:
@@ -4007,6 +4012,7 @@ def _dedupe_upload_rows(rows,mode):
 
 def _eligible_rows(con,mode,context=None):
  context=dict(context or {});where=["post_dir IS NOT NULL","status NOT LIKE '추천제외:%'","COALESCE(already_posted,0)=0"];params=[]
+ policy=affiliate_policy(context)
  batch_id=str(context.get("import_batch_id") or "").strip()
  image_state=str(context.get("import_image_state") or "").strip()
  if batch_id:
@@ -4014,6 +4020,7 @@ def _eligible_rows(con,mode,context=None):
  if image_state:
   where.append("COALESCE(import_image_state,'')=?");params.append(image_state)
  product_ids=[int(x) for x in (context.get("product_ids") or []) if str(x).isdigit()]
+ if "product_ids" in context and not product_ids:return [],[]
  if product_ids:
   where.append("id IN ("+",".join("?" for _ in product_ids)+")");params.extend(product_ids)
  rows=con.execute("SELECT * FROM products WHERE "+" AND ".join(where)+" ORDER BY product_no,id",params).fetchall()
@@ -4022,6 +4029,8 @@ def _eligible_rows(con,mode,context=None):
   reasons=[];images=_physical_images(row)
   if not row["title"] or not row["body"] or not row["tags"]:reasons.append("원고 미완료")
   elif tag_requirement_reason(row):reasons.append(tag_requirement_reason(row))
+  link_reason=affiliate_requirement_reason(row,policy)
+  if link_reason:reasons.append(link_reason)
   if mode!="text_only":
    image_ok,image_detail=verified_blog_image_set(row,3)
    if not image_ok:reasons.append(image_detail.get("reason") or f"제품 이미지 {len(images)}/3")
@@ -4034,7 +4043,7 @@ def _eligible_rows(con,mode,context=None):
   else:eligible.append(row)
  return eligible,skipped
 
-def _post_for_mode(row,mode):
+def _post_for_mode(row,mode,affiliate_policy: AffiliatePolicy="existing"):
  """Build the upload layout from the user's reference post structure.
 
  Order: disclosure exactly once -> TOP sharelink -> intro -> image1 -> section1 -> image2 -> section2 ->
@@ -4042,10 +4051,11 @@ def _post_for_mode(row,mode):
  BOTTOM sharelink. Image slots come from reference_layout_slots when present.
  """
  pdir=Path(row["post_dir"]);post=json.loads((pdir/"post.json").read_text(encoding="utf-8"))
+ post.update(prepare_affiliate_post(row,post,affiliate_policy))
  # Rebuild only placement-sensitive blocks. Never trust stale image/sharelink positions.
  blocks=[dict(b) for b in (post.get("blocks") or []) if b.get("type") not in ("image","price_compare_image","sharelink")]
  blocks=normalize_disclosure_blocks(blocks)
- share=str((row["sharelink"] if "sharelink" in row.keys() else "") or post.get("sharelink") or "").strip()
+ share="" if affiliate_policy=="omit" else str((row["sharelink"] if "sharelink" in row.keys() else "") or post.get("sharelink") or "").strip()
  if share:blocks.insert(1,{"type":"sharelink","url":share,"position":"top_after_disclosure","source":"coupang_partners"})
  images=[] if mode=="text_only" else _physical_images(row)[:3]
  slots=list(post.get("reference_layout_slots") or ["after_intro","after_section_1","after_section_2"])[:3]
@@ -4217,12 +4227,12 @@ def _text_body_signature(post):
  """Mode-independent visible article text; image components are intentionally ignored."""
  return _compact_text(''.join(_body_expected_lines(post)))
 
-def _write_one_post(d,r,mode):
- pdir=Path(r["post_dir"]);post=_post_for_mode(r,mode);top=r['product_no'] or r['id']
+def _write_one_post(d,r,mode,affiliate_policy: AffiliatePolicy="existing"):
+ pdir=Path(r["post_dir"]);post=_post_for_mode(r,mode,affiliate_policy=affiliate_policy);top=r['product_no'] or r['id']
  # v8.08.26: image/text-only modes MUST use the exact same textual article.
  # Only image components may differ.  This guard prevents a future branch from
  # silently shortening/rewording the image-3 article.
- canonical_text_post=_post_for_mode(r,"text_only")
+ canonical_text_post=_post_for_mode(r,"text_only",affiliate_policy=affiliate_policy)
  if _text_body_signature(post)!=_text_body_signature(canonical_text_post):
   raise RuntimeError(f'모드별 본문 불일치 감지: {mode} 원고와 텍스트만 원고의 글 내용/길이가 다릅니다')
  sig=_text_body_signature(post)
@@ -4306,12 +4316,13 @@ def _recycle_driver_between_posts(d,reason):
 
 def run(context=None,progress=None):
  ctx=dict(context or {});mode=str(ctx.get("mode") or settings().get("blog_default_mode","images_only"))
+ policy=affiliate_policy(ctx)
  target=require_target_blog_id();activate_blog_scope()
  stop_check=ctx.get("stop_check")
  if callable(stop_check) and stop_check():return {"processed":0,"stage_ok":False,"stopped":True,"message":"블로그 저장 중지"}
  if mode not in {"images_only","price_complete","text_only"}:mode="images_only"
  con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
- repair=_rebase_local_artifacts(con)
+ repair=_rebase_local_artifacts(con,ctx)
  rows,skipped=_eligible_rows(con,mode,ctx)
  rows,dedupe_skipped,history=_dedupe_upload_rows(rows,mode);skipped.extend(dedupe_skipped)
  if not rows:
@@ -4335,7 +4346,7 @@ def run(context=None,progress=None):
    ok=False;last_error=""
    for attempt in range(1,retry_count+1):
     try:
-     _write_one_post(d,r,mode);ok=True;break
+     _write_one_post(d,r,mode,affiliate_policy=policy);ok=True;break
     except Exception as e:
      last_error=f"{type(e).__name__}: {e}";log(f"네이버 임시저장 실패 TOP{r['product_no'] or r['id']} 시도 {attempt}/{retry_count}: {last_error}")
      shot,html=_save_blog_failure_diagnostic(d,r,attempt,last_error)

@@ -47,6 +47,9 @@ def _update_post_file(row,link,evidence):
 def run(context=None,progress=None,stop_check: Callable[[], bool] | None = None):
     init_db_fast();cfg=settings();con=db_connect(row_factory=True)
     all_rows=con.execute("SELECT * FROM products WHERE post_dir IS NOT NULL AND status NOT LIKE '추천제외:%' AND COALESCE(already_posted,0)=0 ORDER BY product_no,id").fetchall()
+    if isinstance(context,dict) and "product_ids" in context:
+        selected={int(value) for value in (context.get("product_ids") or []) if str(value).isdigit()}
+        all_rows=[row for row in all_rows if row["id"] in selected]
     rows=[];skipped=[]
     for row in all_rows:
         if is_wala_product(row):
