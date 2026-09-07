@@ -6,6 +6,7 @@ from tkinter import ttk,messagebox,filedialog,simpledialog
 ROOT=(Path(sys.executable).resolve().parent if getattr(sys,"frozen",False) else Path(__file__).resolve().parent);sys.path.insert(0,str(ROOT))
 from modules.common import *
 from modules import search_adapter,content_adapter,content_text_adapter,image_adapter,price_adapter,blog_adapter,video_adapter,toss_sharelink_pc,market_safe,coupang_safe,chrome_collector,coupang_partners_api,coupang_sharelink_adapter,toss_sharelink_api,naver_shopping_api,trend_collection_adapter,trend_coupang_adapter,celebrity_style_adapter,external_batch_import,already_posted_adapter,workflow_assistant,ollama_local
+from modules import blog_target,blog_tag_policy,collection_preferences,published_product_registry
 RUNTIME_MIGRATION=migrate_previous_install_data()
 init_db()
 STEPS=[
@@ -23,6 +24,11 @@ class App(tk.Tk):
   ww=min(1680,max(1040,int(sw*0.92)));wh=min(1020,max(700,int(sh*0.90)))
   self.geometry(f"{ww}x{wh}+{max(0,(sw-ww)//2)}+{max(0,(sh-wh)//2)}");self.minsize(980,680)
   self.q=queue.Queue();self.worker=None;self.stop=False;self.vars={};self.pbs={}
+  self.target_blog_var=tk.StringVar(value=blog_target.get_target_blog_id())
+  self.target_blog_status=tk.StringVar(value=blog_target.public_blog_url() or "대상 미설정 · 블로그 주소를 저장해 주세요.")
+  self.collection_display_preferences=collection_preferences.load_preferences()
+  self.collection_selection_vars:dict[str,dict[str,tk.BooleanVar]]={}
+  self.collection_selection_summary=tk.StringVar()
   self.page_canvases={};self.page_canvas_windows={};self.page_scrollbars={};self._responsive_mode={}
   self.style();self.build();self.refresh();self.after(150,self.poll);self.after(600,self.health);self.after(1000,self._tick_content_live)
  def style(self):
@@ -258,6 +264,7 @@ class App(tk.Tk):
   self.global_stage_var=tk.StringVar(value="대기")
   self.global_detail_var=tk.StringVar(value="실행할 작업을 선택하세요.")
   self.global_eta_var=tk.StringVar(value="ETA -")
+  ttk.Button(livebar,text="중지",style="Danger.TButton",command=self.request_stop).pack(side="right",padx=(0,8))
   tk.Label(livebar,textvariable=self.global_stage_var,bg="#fbfbfe",fg=self.COLORS["accent"],font=("Malgun Gothic",8,"bold"),width=18,anchor="w").pack(side="left",padx=(18,8),pady=5)
   self.global_live_pb=ttk.Progressbar(livebar,maximum=100,length=150);self.global_live_pb.pack(side="left",padx=(0,8),pady=8)
   tk.Label(livebar,textvariable=self.global_detail_var,bg="#fbfbfe",fg=self.COLORS["text"],font=("Malgun Gothic",8),anchor="w").pack(side="left",fill="x",expand=True,padx=(0,8),pady=5)
@@ -269,10 +276,10 @@ class App(tk.Tk):
   self._build_overview_page(self._page("overview","대시보드","오늘의 수집·작성·이미지·임시저장 상태를 한눈에 확인합니다."))
   self._build_account_page(self._page("account","계정 · 연결","네이버 블로그, Chrome, 쿠팡/네이버/토스 API 연결 상태를 관리합니다."))
   self._build_ai_page(self._page("ai","AI 설정","Ollama Qwen3 무료 로컬 AI를 1순위로 사용해 제목·본문·태그를 다양하게 생성합니다."))
-  self._build_categories_page(self._page("categories","카테고리 & 키워드","고정 카테고리, 트렌드 수집과 키워드 흐름을 확인합니다."))
+  self._build_categories_page(self._page("categories","카테고리 & 키워드","수집할 카테고리와 트렌드 연령대를 선택합니다."))
   self._build_collect_settings_page(self._page("collect_settings","수집 · 설정","3사 상품 수집 및 동일상품 이미지 수집 정책을 한곳에서 확인합니다."))
   self._build_collect_run_page(self._page("collect_run","수집 센터","쿠팡·토스·네이버 3사 수집과 아이템스카우트·네이버 데이터랩 트렌드 수집을 한 화면에서 실행하고 진행률을 확인합니다."))
-  self._build_celebrity_style_page(self._page("celebrity_style","연예인 착장 트렌드","최근 뉴스·블로그·Google 공개 자료를 교차검증해 연예인 착장 후보를 찾고, Ollama/Qwen3-VL 보조 분석 후 정확상품·추정·유사스타일을 구분해 원고를 만듭니다."))
+  self._build_celebrity_style_page(self._page("celebrity_style","왈라랜드 착장 콘텐츠","wala-land.com 공개 콘텐츠의 인물·착장·소개 상품·출처를 모아 원고를 만듭니다. 기존 Ollama/Qwen3-VL 모델 설정을 사용합니다."))
   self._build_write_settings_page(self._page("write_settings","작성 · 설정","Ollama 무료 AI 원고 생성, 이미지 3장, SEO 품질검수 흐름을 관리합니다."))
   self._build_persona_page(self._page("persona","작성 · 페르소나","AI가 상품마다 다른 관점과 소비자 중심 표현을 사용하도록 작성 전략을 확인합니다."))
   self._build_disclosure_page(self._page("disclosure","작성 · 광고 고지","경제적 이해관계 고지문과 제휴링크 정책을 확인합니다."))
@@ -301,7 +308,7 @@ class App(tk.Tk):
  def _build_overview_page(self,p):
   grid=tk.Frame(p,bg=self.COLORS["bg"]);grid.pack(fill="x")
   for i in range(5):grid.grid_columnconfigure(i,weight=1)
-  metrics=[("전체 상품","overview_total","0"),("원고 준비","overview_content","0"),("사진 3장 완료","overview_images","0"),("임시저장 준비","overview_ready","0"),("기존 게시 제외","overview_posted","0")]
+  metrics=[("전체 상품","overview_total","0"),("원고 준비","overview_content","0"),("사진 3장 완료","overview_images","0"),("임시저장 준비","overview_ready","0"),("게시·저장 이력 제외","overview_posted","0")]
   self.overview_vars={};self.overview_metric_cards=[]
   for i,(label,key,default) in enumerate(metrics):
    c=self._card(grid);c.grid(row=0,column=i,sticky="nsew",padx=4,pady=4);self.overview_metric_cards.append(c)
@@ -339,6 +346,11 @@ class App(tk.Tk):
   p.bind("<Configure>",_overview_reflow,add="+")
 
  def _build_account_page(self,p):
+  target=self._card(p,"저장할 네이버 블로그","블로그 주소 또는 ID를 저장하세요. 임시저장과 기존 게시글 대조는 이 블로그를 기준으로 실행됩니다.");target.pack(fill="x",pady=(0,12))
+  row=tk.Frame(target,bg=self.COLORS["card"]);row.pack(fill="x",padx=14,pady=(6,8));row.columnconfigure(0,weight=1)
+  ttk.Entry(row,textvariable=self.target_blog_var).grid(row=0,column=0,sticky="ew",padx=(0,8))
+  ttk.Button(row,text="블로그 저장",style="Accent.TButton",command=self.save_target_blog).grid(row=0,column=1)
+  ttk.Label(target,textvariable=self.target_blog_status,style="Card.TLabel",wraplength=620).pack(anchor="w",padx=14,pady=(0,14))
   c=self._card(p,"연결 상태","새 버전은 이전 설치의 API/Chrome 연결 설정을 자동 승계합니다.");c.pack(fill="x")
   row=tk.Frame(c,bg="white");row.pack(fill="x",padx=14,pady=(6,14))
   for i in range(4):row.grid_columnconfigure(i,weight=1)
@@ -374,16 +386,70 @@ class App(tk.Tk):
   ttk.Button(rr,text="기존 원고 포함 전체 재생성",style="Soft.TButton",command=self.content_force_regenerate).grid(row=0,column=1,sticky="ew",padx=(4,0))
 
  def _build_categories_page(self,p):
-  c=self._card(p,"기본 수집 카테고리","생활용품 · 주방용품 · 패션잡화 · 식품 · 디지털/가전 · 화장품/미용");c.pack(fill="x")
-  r=tk.Frame(c,bg="white");r.pack(fill="x",padx=14,pady=(8,14))
-  for i,name in enumerate(settings().get("categories",[])):
-   tk.Label(r,text=name,bg="#f0edff",fg=self.COLORS["accent"],font=("Malgun Gothic",9,"bold"),padx=10,pady=6).grid(row=0,column=i,sticky="w",padx=(0,5))
-  tr=self._card(p,"트렌드 키워드","트렌드와 3사 상품 수집을 분리하지 않고 ‘수집 센터’에서 함께 관리합니다.");tr.pack(fill="x",pady=(12,0))
-  rr=tk.Frame(tr,bg="white");rr.pack(fill="x",padx=14,pady=(6,14));rr.grid_columnconfigure(0,weight=1)
-  ttk.Button(rr,text="수집 센터 열기 · 3사 + 트렌드",style="Accent.TButton",command=lambda:self.show_page("collect_run")).grid(row=0,column=0,sticky="ew")
+  prefs=self.collection_display_preferences
+  groups=(("market","3사 상품 카테고리",collection_preferences.MARKET_CATEGORIES,prefs.market_categories),
+          ("trend","트렌드 카테고리",collection_preferences.TREND_CATEGORIES,prefs.trend_categories),
+          ("age","트렌드 연령대",tuple(collection_preferences.AGE_GROUPS),prefs.age_groups))
+  for key,title,choices,selected in groups:
+   card=self._card(p,title,"선택한 항목만 다음 수집과 상품 연결에 반영됩니다.");card.pack(fill="x",pady=(0,12))
+   row=ttk.Frame(card,padding=14);row.pack(fill="x")
+   for col in range(3):row.columnconfigure(col,weight=1)
+   variables={name:tk.BooleanVar(value=name in selected) for name in choices};self.collection_selection_vars[key]=variables
+   for i,(name,var) in enumerate(variables.items()):
+    ttk.Checkbutton(row,text=name,variable=var,command=self.update_collection_selection_summary).grid(row=i//3,column=i%3,sticky="w",padx=4,pady=4)
+  ttk.Label(p,textvariable=self.collection_selection_summary,wraplength=620).pack(fill="x",pady=(0,8))
+  actions=ttk.Frame(p);actions.pack(fill="x")
+  for i in range(4):actions.columnconfigure(i,weight=1)
+  for i,(label,command) in enumerate((("전체 선택",lambda:self.set_collection_selection(True)),("선택 해제",lambda:self.set_collection_selection(False)),("선택 저장",self.save_collection_selection),("수집 센터 열기",lambda:self.show_page("collect_run")))):
+   ttk.Button(actions,text=label,style="Accent.TButton" if i==2 else "Soft.TButton",command=command).grid(row=0,column=i,sticky="ew",padx=4)
+  self.update_collection_selection_summary()
+
+ def selected_collection_preferences(self) -> collection_preferences.CollectionPreferences:
+  selected={key:tuple(name for name,var in values.items() if var.get()) for key,values in self.collection_selection_vars.items()}
+  preferences=collection_preferences.CollectionPreferences(market_categories=selected["market"],trend_categories=selected["trend"],age_groups=selected["age"])
+  self.collection_display_preferences=preferences
+  return preferences
+
+ def update_collection_selection_summary(self) -> None:
+  counts={key:sum(var.get() for var in values.values()) for key,values in self.collection_selection_vars.items()}
+  self.collection_selection_summary.set(f"3사 {counts['market']}개 카테고리 · 트렌드 {counts['trend']}개 카테고리 · {counts['age']}개 연령대\n각 그룹을 하나 이상 선택하세요. ‘선택 저장’을 누르면 다음 실행에도 유지됩니다.")
+
+ def set_collection_selection(self,selected:bool) -> None:
+  for values in self.collection_selection_vars.values():
+   for var in values.values():var.set(selected)
+  self.update_collection_selection_summary()
+
+ def save_collection_selection(self) -> None:
+  try:collection_preferences.save_preferences(self.selected_collection_preferences())
+  except (ValueError,OSError) as exc:
+   messagebox.showerror("수집 설정",str(exc));return
+  self.refresh();messagebox.showinfo("수집 설정","카테고리와 연령대 선택을 저장했습니다.")
+
+ def save_target_blog(self) -> None:
+  if self.worker and self.worker.is_alive():
+   messagebox.showwarning("실행 중","작업이 끝나거나 중지된 뒤 대상 블로그를 바꿔 주세요.");return
+  try:
+   value=blog_target.save_target_blog(self.target_blog_var.get())
+   already_posted_adapter.activate_blog_scope()
+  except (blog_target.BlogTargetError,ValueError,OSError,sqlite3.Error) as exc:
+   messagebox.showerror("블로그 주소 오류",str(exc));return
+  self.target_blog_var.set(value);self.target_blog_status.set(blog_target.public_blog_url())
+  self.refresh();messagebox.showinfo("블로그 설정","저장 대상: "+blog_target.public_blog_url())
+
+ def require_target_blog(self) -> bool:
+  try:
+   if blog_target.get_target_blog_id():return True
+  except blog_target.BlogTargetError as exc:
+   self.show_page("account");messagebox.showwarning("블로그 주소 확인",str(exc));return False
+  self.show_page("account");messagebox.showwarning("블로그 설정 필요","계정 · 연결에서 저장할 네이버 블로그 주소 또는 ID를 먼저 저장해 주세요.")
+  return False
+
+ def request_stop(self) -> None:
+  self.stop=True
+  self._set_global_live(stage="중지 요청",detail="진행 중인 요청이 끝나면 다음 항목부터 중지합니다.")
 
  def _build_collect_settings_page(self,p):
-  c=self._card(p,"현재 수집 정책","3사 고정 카테고리 수집 + 쿠팡 트렌드 API 우선 + 동일상품 이미지 3장 정확도 우선 정책");c.pack(fill="x")
+  c=self._card(p,"현재 수집 정책","선택한 3사 카테고리 수집 + 쿠팡 트렌드 API 우선 + 동일상품 이미지 3장 정확도 우선 정책");c.pack(fill="x")
   r=tk.Frame(c,bg="white");r.pack(fill="x",padx=14,pady=(6,14))
   items=[("3사 상품 수집","쿠팡 · 토스 · 네이버, 카테고리별 30개"),("트렌드 추출","쿠팡 웹검색 대신 Partners API 우선"),("이미지 3장","쿠팡 API → NAVER 이미지 API exact 우선 → 부족 시 쿠팡 상세/Google 원본검증"),("안전 규칙","틀린 사진으로 억지 3장 채우기 금지")]
   for i,(a,b) in enumerate(items):
@@ -402,7 +468,7 @@ class App(tk.Tk):
 
   dual=tk.Frame(p,bg=self.COLORS["bg"]);dual.pack(fill="x",pady=(12,0));dual.grid_columnconfigure(0,weight=1);dual.grid_columnconfigure(1,weight=1)
   # 3-site collection
-  left=self._card(dual,"3사 사이트 인기상품 수집","쿠팡 · 토스쇼핑 · 네이버쇼핑을 고정 카테고리 기준으로 한 번에 수집합니다.");left.grid(row=0,column=0,sticky="nsew",padx=(0,6))
+  left=self._card(dual,"3사 사이트 인기상품 수집","카테고리 & 키워드에서 선택한 카테고리를 쿠팡 · 토스 · 네이버에서 수집합니다.");left.grid(row=0,column=0,sticky="nsew",padx=(0,6))
   self.collect_source_metric_vars={}
   metric=tk.Frame(left,bg="white");metric.pack(fill="x",padx=14,pady=(4,8))
   for i,(key,label) in enumerate([("쿠팡","쿠팡"),("토스쇼핑","토스"),("네이버쇼핑","네이버")]):
@@ -469,66 +535,83 @@ class App(tk.Tk):
   self.after_idle(lambda:self._layout_collect_page(p.winfo_width()))
 
  def _build_celebrity_style_page(self,p):
-  top=self._card(p,"실시간 착장 후보 수집","자동 수집은 최근 공항패션·브랜드행사·시사회·제작발표회·출근길·사복 키워드를 검색합니다. 특정 연예인을 입력하면 그 인물만 좁혀서 확인합니다.")
+  top=self._card(p,"왈라랜드 전체 아카이브 수집","공개 콘텐츠 목록을 확인하고 아직 받지 않은 글을 회차별로 이어서 수집합니다. 기간은 실제 게시일 기준이며, 전체를 선택하면 과거 콘텐츠도 포함합니다.")
   top.pack(fill="x")
   row=tk.Frame(top,bg="white");row.pack(fill="x",padx=14,pady=(6,8));row.grid_columnconfigure(1,weight=1)
-  tk.Label(row,text="연예인 직접 검색",bg="white",fg=self.COLORS["text"],font=("Malgun Gothic",9,"bold")).grid(row=0,column=0,sticky="w",padx=(0,8))
+  tk.Label(row,text="인물·콘텐츠 검색",bg="white",fg=self.COLORS["text"],font=("Malgun Gothic",9,"bold")).grid(row=0,column=0,sticky="w",padx=(0,8))
   self.celeb_name_var=tk.StringVar(value="")
   ttk.Entry(row,textvariable=self.celeb_name_var).grid(row=0,column=1,sticky="ew",padx=(0,8))
   tk.Label(row,text="기간",bg="white",fg=self.COLORS["text"],font=("Malgun Gothic",9,"bold")).grid(row=0,column=2,sticky="e",padx=(0,6))
-  self.celeb_period_var=tk.StringVar(value="3일")
-  ttk.Combobox(row,textvariable=self.celeb_period_var,state="readonly",values=["1일","3일","7일","14일"],width=7).grid(row=0,column=3,sticky="e")
+  self.celeb_period_var=tk.StringVar(value="전체")
+  ttk.Combobox(row,textvariable=self.celeb_period_var,state="readonly",values=["전체","7일","30일","365일"],width=7).grid(row=0,column=3,sticky="e")
+  tk.Label(row,text="회차 수집량",bg="white",fg=self.COLORS["text"],font=("Malgun Gothic",9,"bold")).grid(row=1,column=0,sticky="w",padx=(0,8),pady=(8,0))
+  self.celeb_batch_var=tk.StringVar(value="50")
+  ttk.Spinbox(row,from_=1,to=500,textvariable=self.celeb_batch_var,width=7).grid(row=1,column=1,sticky="w",pady=(8,0))
+  ttk.Button(row,text="작업 중지",style="Danger.TButton",command=self.stop_celebrity_style).grid(row=1,column=2,columnspan=2,sticky="e",pady=(8,0))
   br=tk.Frame(top,bg="white");br.pack(fill="x",padx=14,pady=(0,14))
   for i in range(4):br.grid_columnconfigure(i,weight=1)
-  ttk.Button(br,text="🔥 최신 착장 자동 수집",style="Accent.TButton",command=lambda:self.celebrity_style_run("collect_auto")).grid(row=0,column=0,sticky="ew",padx=(0,4))
-  ttk.Button(br,text="🔎 입력 연예인 검색",style="Soft.TButton",command=lambda:self.celebrity_style_run("collect_manual")).grid(row=0,column=1,sticky="ew",padx=4)
-  ttk.Button(br,text="▶ 전체 자동 파이프라인",style="Soft.TButton",command=lambda:self.celebrity_style_run("full")).grid(row=0,column=2,sticky="ew",padx=4)
+  ttk.Button(br,text="다음 회차 수집",style="Accent.TButton",command=lambda:self.celebrity_style_run("collect_auto")).grid(row=0,column=0,sticky="ew",padx=(0,4))
+  ttk.Button(br,text="입력 인물로 수집",style="Soft.TButton",command=lambda:self.celebrity_style_run("collect_manual")).grid(row=0,column=1,sticky="ew",padx=4)
+  ttk.Button(br,text="수집 → 원고 자동 실행",style="Soft.TButton",command=lambda:self.celebrity_style_run("full")).grid(row=0,column=2,sticky="ew",padx=4)
   ttk.Button(br,text="CSV 열기",style="Soft.TButton",command=self.open_celebrity_style_csv).grid(row=0,column=3,sticky="ew",padx=(4,0))
 
-  policy=self._card(p,"20년차 검증형 정확도 정책","사진만 보고 브랜드를 확정하지 않습니다. 인물·행사·날짜를 먼저 묶고, 독립 출처 교차확인과 상품명 검증을 거쳐 확정/추정/유사스타일을 분리합니다.")
+  policy=self._card(p,"왈라랜드 출처 · 상품 근거","착장 정보는 왈라랜드 단일 출처입니다. 왈라랜드가 소개한 상품과 독립적으로 확인한 실제 착용품은 구분합니다.")
   policy.pack(fill="x",pady=(10,0))
   self.celeb_policy_var=tk.StringVar(value="Qwen3-VL 상태 확인 중")
   tk.Label(policy,textvariable=self.celeb_policy_var,bg="white",fg=self.COLORS["accent"],font=("Malgun Gothic",9,"bold"),anchor="w").pack(fill="x",padx=14,pady=(5,2))
-  txt=("• 확정: 텍스트에 브랜드+구체 제품/모델 근거가 있고, 독립 출처 2개 이상 또는 신뢰도 높은 원문 근거 + 쇼핑 상품명이 일치\n"
-       "• 추정: 브랜드만 언급되거나 Vision이 로고/색상/실루엣만 포착한 경우 — 정확 제품이라고 쓰지 않음\n"
-       "• 유사스타일: 정확 착용품을 검증하지 못했지만 비슷한 스타일의 판매상품을 찾은 경우 — 글에서도 명확히 유사상품으로 표시\n"
-       "• 저작권 안전: 뉴스/블로그의 연예인 사진은 분석 근거로만 사용하고 블로그 이미지 3장으로 자동 재게시하지 않음")
-  tk.Label(policy,text=txt,bg="white",fg=self.COLORS["text"],justify="left",anchor="w",font=("Malgun Gothic",9)).pack(fill="x",padx=14,pady=(2,8))
+  txt=("• 상품명·브랜드·가격·링크는 왈라랜드 게시 정보로 표시하며, 현재 판매가와 다를 수 있습니다.\n"
+       "• 게시일은 행사일이나 실제 착용일을 의미하지 않습니다. 사진만으로 브랜드·제품을 확정하지 않습니다.\n"
+       "• 원본 사진은 근거 확인용입니다. 원고에 출처를 남기며 사진을 자동 재게시하지 않습니다.")
+  policy_text=tk.Label(policy,text=txt,bg="white",fg=self.COLORS["text"],justify="left",anchor="w",font=("Malgun Gothic",9))
+  policy_text.pack(fill="x",padx=14,pady=(2,8))
+  policy.bind("<Configure>",lambda e:policy_text.configure(wraplength=max(220,e.width-32)),add="+")
   pr=tk.Frame(policy,bg="white");pr.pack(fill="x",padx=14,pady=(0,14))
   for i in range(3):pr.grid_columnconfigure(i,weight=1)
   ttk.Button(pr,text="Qwen3-VL Vision 자동설치",style="Soft.TButton",command=self.ollama_vision_setup).grid(row=0,column=0,sticky="ew",padx=(0,4))
-  ttk.Button(pr,text="착장 관련 이미지 가져오기",style="Soft.TButton",command=lambda:self.celebrity_style_run("images_selected_or_all")).grid(row=0,column=1,sticky="ew",padx=4)
+  ttk.Button(pr,text="왈라랜드 근거 이미지",style="Soft.TButton",command=lambda:self.celebrity_style_run("images_selected_or_all")).grid(row=0,column=1,sticky="ew",padx=4)
   ttk.Button(pr,text="착장 AI 근거분석",style="Soft.TButton",command=lambda:self.celebrity_style_run("analyze_selected_or_all")).grid(row=0,column=2,sticky="ew",padx=(4,0))
 
-  act=self._card(p,"상품 검증 · 원고 · 기존 파이프라인 연결","정확상품과 유사스타일을 구분해서 매칭한 뒤 연예인 착장 글을 생성합니다. 선택 원고를 기존 작성물로 보내면 그 상품명을 기준으로 기존의 엄격 이미지 3장/Sharelink/SmartEditor 기능을 그대로 사용할 수 있습니다.")
+  act=self._card(p,"소개 상품 · 원고 · 작성물 연결","왈라랜드에 연결된 상품을 정리하고 출처를 표시한 착장 원고를 생성합니다. 선택 원고는 작성물 관리로 보내 텍스트 임시저장할 수 있습니다.")
   act.pack(fill="x",pady=(10,0))
   ar=tk.Frame(act,bg="white");ar.pack(fill="x",padx=14,pady=(6,14))
   for i in range(4):ar.grid_columnconfigure(i,weight=1)
-  ttk.Button(ar,text="① 상품 검증/매칭",style="Soft.TButton",command=lambda:self.celebrity_style_run("match_selected_or_all")).grid(row=0,column=0,sticky="ew",padx=(0,4))
-  ttk.Button(ar,text="② 착장 블로그 원고 생성",style="Accent.TButton",command=lambda:self.celebrity_style_run("draft_selected_or_all")).grid(row=0,column=1,sticky="ew",padx=4)
-  ttk.Button(ar,text="③ 선택 원고 → 작성물 연동",style="Soft.TButton",command=self.celebrity_style_promote_selected).grid(row=0,column=2,sticky="ew",padx=4)
-  ttk.Button(ar,text="④ 연동 원고 텍스트 임시저장",style="Soft.TButton",command=self.celebrity_style_blog_selected).grid(row=0,column=3,sticky="ew",padx=(4,0))
+  ttk.Button(ar,text="① 소개 상품 연결",style="Soft.TButton",command=lambda:self.celebrity_style_run("match_selected_or_all")).grid(row=0,column=0,sticky="ew",padx=(0,4))
+  ttk.Button(ar,text="② 원고 생성",style="Accent.TButton",command=lambda:self.celebrity_style_run("draft_selected_or_all")).grid(row=0,column=1,sticky="ew",padx=4)
+  ttk.Button(ar,text="③ 작성물로 보내기",style="Soft.TButton",command=self.celebrity_style_promote_selected).grid(row=0,column=2,sticky="ew",padx=4)
+  ttk.Button(ar,text="④ 텍스트 임시저장",style="Soft.TButton",command=self.celebrity_style_blog_selected).grid(row=0,column=3,sticky="ew",padx=(4,0))
 
   self.celeb_style_pb=ttk.Progressbar(p,maximum=100);self.celeb_style_pb.pack(fill="x",pady=(10,3))
-  self.celeb_style_info=tk.StringVar(value="연예인 착장 수집 대기")
+  self.celeb_style_info=tk.StringVar(value="왈라랜드 수집 대기 · 회차를 반복하면 미수집 콘텐츠부터 이어집니다.")
   ttk.Label(p,textvariable=self.celeb_style_info,style="PageSub.TLabel").pack(anchor="w",fill="x",pady=(0,6))
   self.celeb_style_summary=tk.StringVar(value="후보 0 · 분석 0 · 상품매칭 0 · 원고 0")
   ttk.Label(p,textvariable=self.celeb_style_summary,style="PageSub.TLabel",foreground=self.COLORS["accent"]).pack(anchor="w",fill="x",pady=(0,6))
 
+  self.celeb_style_offset=0
+  pager=ttk.Frame(p);pager.pack(fill="x",pady=(2,6))
+  self.celeb_prev_button=ttk.Button(pager,text="이전",style="Soft.TButton",command=lambda:self.celebrity_style_page(-1))
+  self.celeb_prev_button.pack(side="left")
+  self.celeb_next_button=ttk.Button(pager,text="다음",style="Soft.TButton",command=lambda:self.celebrity_style_page(1))
+  self.celeb_next_button.pack(side="right")
+  self.celeb_page_var=tk.StringVar(value="1 / 1 페이지")
+  ttk.Label(pager,textvariable=self.celeb_page_var,style="PageSub.TLabel").pack(expand=True)
   table=self._card(p,"착장 후보 · 근거 상태");table.pack(fill="both",expand=True,pady=(2,0))
+  table_body=tk.Frame(table,bg=self.COLORS["card"]);table_body.pack(fill="both",expand=True,padx=14,pady=(4,14))
+  table_body.grid_columnconfigure(0,weight=1);table_body.grid_rowconfigure(0,weight=1)
   cols=("id","celeb","date","look","sources","confidence","items","matched","status")
-  self.celeb_style_tree=ttk.Treeview(table,columns=cols,show="headings",height=11)
-  for c,h,w in [("id","ID",45),("celeb","연예인",90),("date","기준일",92),("look","착장상황",105),("sources","독립출처",70),("confidence","신뢰점수",70),("items","아이템",60),("matched","상품",60),("status","상태",150)]:
-   self.celeb_style_tree.heading(c,text=h);self.celeb_style_tree.column(c,width=w,anchor="w")
-  sy=ttk.Scrollbar(table,orient="vertical",command=self.celeb_style_tree.yview);self.celeb_style_tree.configure(yscrollcommand=sy.set)
-  self.celeb_style_tree.pack(side="left",fill="both",expand=True,padx=(14,0),pady=(4,14));sy.pack(side="right",fill="y",padx=(0,14),pady=(4,14))
+  self.celeb_style_tree=ttk.Treeview(table_body,columns=cols,show="headings",height=11)
+  for c,h,w in [("id","ID",45),("celeb","인물/콘텐츠",180),("date","게시일",92),("look","콘텐츠분류",105),("sources","출처 수",70),("confidence","근거점수",70),("items","아이템",60),("matched","소개상품",70),("status","상태",150)]:
+   self.celeb_style_tree.heading(c,text=h);self.celeb_style_tree.column(c,width=w,minwidth=w,stretch=False,anchor="w")
+  sy=ttk.Scrollbar(table_body,orient="vertical",command=self.celeb_style_tree.yview)
+  sx=ttk.Scrollbar(table_body,orient="horizontal",command=self.celeb_style_tree.xview)
+  self.celeb_style_tree.configure(yscrollcommand=sy.set,xscrollcommand=sx.set)
+  self.celeb_style_tree.grid(row=0,column=0,sticky="nsew");sy.grid(row=0,column=1,sticky="ns");sx.grid(row=1,column=0,sticky="ew")
   self.celeb_style_tree.bind("<<TreeviewSelect>>",lambda e:self.show_celebrity_style_detail())
 
   detail=self._card(p,"선택 착장 상세 · 출처/아이템/원고 미리보기");detail.pack(fill="both",expand=True,pady=(10,16))
   self.celeb_style_detail=tk.Text(detail,height=18,wrap="word",font=("Malgun Gothic",9),bg="#fbfbfe",fg=self.COLORS["text"],relief="flat",padx=10,pady=10)
   self.celeb_style_detail.pack(fill="both",expand=True,padx=14,pady=(4,14))
   try:
-   vs=celebrity_style_adapter.vision_status();self.celeb_policy_var.set(vs.get("message") or "Vision 상태 미확인")
+   vs=celebrity_style_adapter.vision_status();self.celeb_policy_var.set(str(vs.get("message") or "Vision 상태 미확인"))
   except Exception as e:self.celeb_policy_var.set("Vision 상태 확인 실패: "+str(e))
 
  def _build_write_settings_page(self,p):
@@ -562,6 +645,11 @@ class App(tk.Tk):
 
  def _build_publish_page(self,p):
   c=self._card(p,"네이버 블로그 임시저장","텍스트/이미지3장 모드 모두 동일 원고를 사용하며, 같은 Chrome + 같은 탭을 재사용합니다.");c.pack(fill="x")
+  ttk.Label(c,textvariable=self.target_blog_status,style="Card.TLabel",wraplength=620).pack(anchor="w",padx=14,pady=(6,0))
+  target_actions=ttk.Frame(c,padding=14);target_actions.pack(fill="x")
+  for col in range(3):target_actions.columnconfigure(col,weight=1)
+  for i,(label,command) in enumerate((("대상 블로그 설정",lambda:self.show_page("account")),("게시 · 임시저장 기록",self.show_publication_history),("대상 블로그 RSS 대조",self.existing_post_auto))):
+   ttk.Button(target_actions,text=label,style="Soft.TButton",command=command).grid(row=0,column=i,sticky="ew",padx=4)
   r=tk.Frame(c,bg="white");r.pack(fill="x",padx=14,pady=(8,14));
   for i in range(3):r.grid_columnconfigure(i,weight=1)
   ttk.Button(r,text="① 저장환경 사전점검",style="Soft.TButton",command=self.blog_preflight).grid(row=0,column=0,sticky="ew",padx=(0,4))
@@ -570,8 +658,28 @@ class App(tk.Tk):
   ttk.Button(c,text="마지막 실패 1건 안전 재시도",style="Danger.TButton",command=self.retry_last_blog_failure).pack(anchor="e",padx=14,pady=(0,14))
   hist=self._card(p,"최근 작업 상태","최근 상품의 처리상태를 표시합니다.");hist.pack(fill="both",expand=True,pady=(12,0))
   self.publish_tree=ttk.Treeview(hist,columns=("no","name","status","updated"),show="headings",height=10)
-  for c1,h,w in [("no","TOP",55),("name","상품명",520),("status","상태",210),("updated","최근 갱신",150)]:self.publish_tree.heading(c1,text=h);self.publish_tree.column(c1,width=w,anchor="w")
+  for c1,h,w in [("no","TOP",55),("name","상품명",520),("status","상태",210),("updated","최근 갱신",150)]:self.publish_tree.heading(c1,text=h);self.publish_tree.column(c1,width=w,anchor="w",stretch=False)
+  history_scroll=ttk.Scrollbar(hist,orient="horizontal",command=self.publish_tree.xview)
+  self.publish_tree.configure(xscrollcommand=history_scroll.set);history_scroll.pack(side="bottom",fill="x",padx=14,pady=(0,14))
   self.publish_tree.pack(fill="both",expand=True,padx=14,pady=(6,14))
+
+ def show_publication_history(self) -> None:
+  if not self.require_target_blog():return
+  summary=published_product_registry.registry_summary()
+  popup=tk.Toplevel(self);popup.title("게시 · 임시저장 기록");popup.geometry("820x520");popup.minsize(620,400)
+  frame=ttk.Frame(popup,padding=14);frame.pack(fill="both",expand=True)
+  ttk.Label(frame,text=f"{summary.get('blog_id','')} · 게시 {summary.get('published',0)}건 · 임시저장 {summary.get('drafts',0)}건",wraplength=580).pack(anchor="w")
+  ttk.Label(frame,text=f"대조용 게시글 제목 {summary.get('source_posts',0)}개 · 상품을 다시 수집해도 보존됩니다.\n수동 게시 표시를 해제해도 확인된 임시저장 이력은 유지됩니다.",wraplength=580).pack(anchor="w",pady=(4,8))
+  ttk.Button(frame,text="닫기",command=popup.destroy).pack(side="bottom",anchor="e",pady=(8,0))
+  content=ttk.Frame(frame);content.pack(fill="both",expand=True)
+  text=tk.Text(content,wrap="word",font=("Malgun Gothic",10))
+  scroll=ttk.Scrollbar(content,orient="vertical",command=text.yview);text.configure(yscrollcommand=scroll.set)
+  text.pack(side="left",fill="both",expand=True);scroll.pack(side="right",fill="y")
+  entries=published_product_registry.registry_entries()
+  source_labels={"confirmed_naver_draft":"확인된 임시저장","blog_history_import":"기존 저장 기록","studio_db_import":"스튜디오 저장 기록","manual_existing_post":"수동 게시 확인","naver_rss_existing_post":"블로그 RSS 대조","title_file_existing_post":"제목 파일 대조"}
+  lines=[f"{entry.get('name','이름 없음')}\n근거: {', '.join(source_labels.get(source,'이전 기록') for source in entry.get('sources') or [])}\n최근 저장: {entry.get('last_saved_at') or '-'}\n" for entry in entries]
+  text.insert("1.0","\n".join(lines) if lines else "이 블로그의 게시 · 임시저장 기록이 없습니다.");text.configure(state="disabled")
+  popup.transient(self)
 
  def _build_license_page(self,p):
   c=self._card(p,"NBlog Automation Studio","현재 배포본은 로컬 PC에서 실행되는 자동화 스튜디오입니다.");c.pack(fill="x")
@@ -604,7 +712,7 @@ class App(tk.Tk):
   ttk.Button(bar,text="새로고침",command=self.refresh).pack(side="left")
   ttk.Button(bar,text="선택 승인",command=self.approve).pack(side="left",padx=4)
   ttk.Button(bar,text="TOP100 CSV",command=self.export).pack(side="left")
-  ttk.Button(bar,text="원천 540 CSV",command=self.export_candidates).pack(side="left",padx=4)
+  ttk.Button(bar,text="원천 상품 CSV",command=self.export_candidates).pack(side="left",padx=4)
   ttk.Button(bar,text="수집 진단 폴더",command=self.open_collection_diagnostics).pack(side="left",padx=4)
   ttk.Button(bar,text="이미지 실패 진단",command=self.open_image_diagnostics).pack(side="left",padx=4)
   self.collect_summary=tk.StringVar(value="수집 현황: 대기")
@@ -646,9 +754,9 @@ class App(tk.Tk):
   sub=ttk.Notebook(p);sub.pack(fill="both",expand=True,padx=8,pady=(0,8))
   top=ttk.Frame(sub);sub.add(top,text="TOP 100")
   self.source_trees={};self.source_count_labels={}
-  for platform,label in [("쿠팡","쿠팡 수집 180"),("토스쇼핑","토스 수집 180"),("네이버쇼핑","네이버 수집 180")]:
+  for platform,label in [("쿠팡","쿠팡 수집"),("토스쇼핑","토스 수집"),("네이버쇼핑","네이버 수집")]:
    f=ttk.Frame(sub);sub.add(f,text=label);self._build_source_tree(f,platform)
-  cov=ttk.Frame(sub);sub.add(cov,text="540 수집 검증")
+  cov=ttk.Frame(sub);sub.add(cov,text="선택 카테고리 수집 검증")
   self.coverage_text=tk.Text(cov,font=("Consolas",10),wrap="none");self.coverage_text.pack(fill="both",expand=True,padx=8,pady=8)
 
   pager=ttk.Frame(top,padding=(4,6));pager.pack(fill="x")
@@ -728,7 +836,7 @@ class App(tk.Tk):
   head=ttk.Frame(parent,padding=6);head.pack(fill="x")
   v=tk.StringVar(value=f"{platform}: 0/180");self.source_count_labels[platform]=v
   ttk.Label(head,textvariable=v,font=("Malgun Gothic",10,"bold")).pack(side="left")
-  ttk.Label(head,text="6개 카테고리 × 각 30개 = 180개",foreground="#666666").pack(side="right")
+  ttk.Label(head,text="선택한 카테고리마다 30개 목표 · 표는 보관된 전체 데이터",foreground="#666666").pack(side="right")
   cols=("cat","rank","name","price","url")
   t=ttk.Treeview(parent,columns=cols,show="headings")
   for c,h,w in [("cat","카테고리",110),("rank","카테고리 순위",90),("name","상품명",580),("price","가격",100),("url","상품 URL",520)]:
@@ -741,16 +849,15 @@ class App(tk.Tk):
  def trend_tab(self):
   p=self.tabs["추가 트렌드 수집"]
   bar=ttk.Frame(p,padding=8);bar.pack(fill="x")
-  ttk.Button(bar,text="아이템스카우트 20~30대 / 40~60대",command=lambda:self.trend_collect("아이템스카우트")).pack(side="left")
-  ttk.Button(bar,text="네이버 데이터랩 20~30대 / 40~60대",command=lambda:self.trend_collect("네이버데이터랩")).pack(side="left",padx=4)
+  ttk.Button(bar,text="아이템스카우트 선택 조건 수집",command=lambda:self.trend_collect("아이템스카우트")).pack(side="left")
+  ttk.Button(bar,text="네이버 데이터랩 선택 조건 수집",command=lambda:self.trend_collect("네이버데이터랩")).pack(side="left",padx=4)
   ttk.Button(bar,text="트렌드 → 쿠팡 인기상품 추출",command=self.trend_coupang_extract).pack(side="left",padx=4)
   ttk.Button(bar,text="트렌드 CSV 저장",command=self.export_trends).pack(side="left",padx=4)
   ttk.Button(bar,text="새로고침",command=self.refresh_trends).pack(side="left")
   self.trend_summary=tk.StringVar(value="아이템스카우트 0/360 · 네이버 데이터랩 0/360")
   ttk.Label(bar,textvariable=self.trend_summary,font=("Malgun Gothic",10,"bold")).pack(side="right")
-  note=("기존 쿠팡·토스·네이버 540개 상품 수집과 분리된 보조 트렌드입니다. "
-        "패션의류·패션잡화·화장품/미용·디지털/가전·가구/인테리어·식품 × TOP30 × "
-        "20~30대/40~60대를 각각 수집한 뒤, 같은 카테고리의 동일 키워드는 한 줄로 통합합니다. "
+  note=("카테고리 & 키워드에서 선택한 카테고리와 연령대마다 TOP30을 수집합니다. "
+        "같은 카테고리의 동일 키워드는 한 줄로 통합합니다. "
         "트렌드→쿠팡 버튼은 두 소스를 통합한 카테고리별 TOP30 키워드를 쿠팡에 검색해 대표 인기상품 1개씩 기존 상품목록에 연결합니다.")
   ttk.Label(p,text=note,foreground="#555555",wraplength=1380).pack(anchor="w",padx=10,pady=(0,6))
   self.trend_pb=ttk.Progressbar(p,maximum=100);self.trend_pb.pack(fill="x",padx=10,pady=(0,6))
@@ -776,49 +883,71 @@ class App(tk.Tk):
 
  def celebrity_style_run(self,stage):
   if self.worker and self.worker.is_alive():return messagebox.showwarning("실행 중","다른 작업이 실행 중입니다.")
-  days=int(re.sub(r"\D","",self.celeb_period_var.get() if hasattr(self,"celeb_period_var") else "3") or 3)
+  days=int(re.sub(r"\D","",self.celeb_period_var.get()) or 0)
+  try:max_articles=int(self.celeb_batch_var.get())
+  except ValueError:return messagebox.showwarning("수집량 확인","회차 수집량은 1부터 500까지의 정수로 입력하세요.")
+  if not 1<=max_articles<=500:return messagebox.showwarning("수집량 확인","회차 수집량은 1부터 500까지 입력하세요.")
+  period="전체 기간" if days==0 else f"최근 {days}일"
   name=(self.celeb_name_var.get().strip() if hasattr(self,"celeb_name_var") else "")
-  if stage=="collect_manual" and not name:return messagebox.showwarning("연예인 이름 필요","직접 검색할 연예인 이름을 입력하세요.")
+  if stage=="collect_manual" and not name:return messagebox.showwarning("검색어 필요","수집할 인물 이름이나 콘텐츠 검색어를 입력하세요.")
   ids=self._selected_celebrity_style_ids();self.stop=False
+  if stage in {"collect_auto","collect_manual","full"}:self.celeb_style_offset=0
   def job():
    try:
     def cb(done,total,msg):
      pct=max(0,min(100,int(float(done)/max(1,float(total))*100)));self.q.put(("celeb",pct,msg))
     if stage=="collect_auto":
-     self.q.put(("celeb",2,f"최근 {days}일 연예인 착장 자동 수집 준비"));res=celebrity_style_adapter.collect_latest(days=days,celebrity="",progress=cb)
+     self.q.put(("celeb",2,f"왈라랜드 {period} · 최대 {max_articles}개 이어서 수집"));res=celebrity_style_adapter.collect_latest(days=days,celebrity="",progress=cb,stop_check=lambda:self.stop,max_articles=max_articles)
     elif stage=="collect_manual":
-     self.q.put(("celeb",2,f"{name} 최근 {days}일 착장 검색 준비"));res=celebrity_style_adapter.collect_latest(days=days,celebrity=name,progress=cb)
+     self.q.put(("celeb",2,f"왈라랜드 {name} · {period} 수집 준비"));res=celebrity_style_adapter.collect_latest(days=days,celebrity=name,progress=cb,stop_check=lambda:self.stop,max_articles=max_articles)
     elif stage=="images_selected_or_all":
-     self.q.put(("celeb",2,"연예인명·행사·날짜 기반 착장 관련 이미지 수집 준비"));res=celebrity_style_adapter.collect_reference_images(candidate_ids=ids or None,progress=cb)
+     self.q.put(("celeb",2,"왈라랜드 원문 근거 이미지 수집 준비"));res=celebrity_style_adapter.collect_reference_images(candidate_ids=ids or None,progress=cb,stop_check=lambda:self.stop)
     elif stage=="analyze_selected_or_all":
-     self.q.put(("celeb",2,"인물·행사·날짜·출처·이미지 클러스터 교차검증 준비"));res=celebrity_style_adapter.analyze_unfinished(candidate_ids=ids or None,progress=cb)
+     self.q.put(("celeb",2,"왈라랜드 인물·착장·소개 상품 근거 분석 준비"));res=celebrity_style_adapter.analyze_unfinished(candidate_ids=ids or None,progress=cb,stop_check=lambda:self.stop)
     elif stage=="match_selected_or_all":
-     self.q.put(("celeb",2,"착장 아이템 정확상품/유사스타일 검증 준비"));res=celebrity_style_adapter.match_products(candidate_ids=ids or None,progress=cb)
+     self.q.put(("celeb",2,"왈라랜드 소개 상품 연결 준비"));res=celebrity_style_adapter.match_products(candidate_ids=ids or None,progress=cb,stop_check=lambda:self.stop)
     elif stage=="draft_selected_or_all":
-     self.q.put(("celeb",2,"검증 근거 기반 착장 블로그 원고 생성 준비"));res=celebrity_style_adapter.generate_drafts(candidate_ids=ids or None,progress=cb)
+     self.q.put(("celeb",2,"왈라랜드 출처 기반 착장 원고 생성 준비"));res=celebrity_style_adapter.generate_drafts(candidate_ids=ids or None,progress=cb,stop_check=lambda:self.stop)
     elif stage=="full":
-     self.q.put(("celeb",2,"착장 전체 자동 파이프라인 준비"));res=celebrity_style_adapter.run_full(days=days,celebrity=name,progress=cb)
+     self.q.put(("celeb",2,f"왈라랜드 {period} 수집 → 원고 준비"));res=celebrity_style_adapter.run_full(days=days,celebrity=name,progress=cb,stop_check=lambda:self.stop,max_articles=max_articles)
     else:raise RuntimeError("알 수 없는 연예인 착장 작업: "+str(stage))
-    self.q.put(("celeb",100,res.get("message") or "연예인 착장 작업 완료"));self.q.put(("refresh",));self.emit("[연예인 착장] "+str(res.get("message") or res))
+    stopped=self.stop or bool(res.get("stopped"))
+    message=res.get("message") or ("왈라랜드 작업 중지" if stopped else "왈라랜드 작업 완료")
+    self.q.put(("celeb",0 if stopped else 100,message));self.q.put(("refresh",));self.emit("[연예인 착장] "+str(message))
    except Exception as e:
     self.q.put(("celeb",0,"연예인 착장 작업 실패: "+str(e)));self.emit("[연예인 착장 오류] "+str(e));self.q.put(("refresh",))
   self.worker=threading.Thread(target=job,daemon=True);self.worker.start()
 
+ def stop_celebrity_style(self) -> None:
+  self.stop=True
+  self.celeb_style_info.set("중지 요청 · 현재 처리 중인 항목이 끝나면 멈춥니다.")
+
+ def celebrity_style_page(self,direction: int) -> None:
+  total=celebrity_style_adapter.candidate_total()
+  self.celeb_style_offset=min(max(0,self.celeb_style_offset+direction*300),max(0,(total-1)//300)*300)
+  self.refresh_celebrity_styles()
+
  def refresh_celebrity_styles(self):
   if not hasattr(self,"celeb_style_tree"):return
-  rows=celebrity_style_adapter.candidate_rows(300)
+  total=celebrity_style_adapter.candidate_total()
+  self.celeb_style_offset=min(self.celeb_style_offset,max(0,(total-1)//300)*300)
+  rows=celebrity_style_adapter.candidate_rows(300,offset=self.celeb_style_offset)
   self.celeb_style_tree.delete(*self.celeb_style_tree.get_children())
+  if hasattr(self,"celeb_style_detail"):self.celeb_style_detail.delete("1.0","end")
+  self.celeb_prev_button.configure(state="normal" if self.celeb_style_offset>0 else "disabled")
+  self.celeb_next_button.configure(state="normal" if self.celeb_style_offset+300<total else "disabled")
+  self.celeb_page_var.set(f"{self.celeb_style_offset//300+1} / {max(1,(total+299)//300)} 페이지 · 전체 {total:,}개")
   analyzed=matched=drafts=0
   for r in rows:
    status=str(r.get("status") or "")
    if status not in {"수집완료","착장근거부족"}:analyzed+=1
    if int(r.get("matched_count") or 0)>0:matched+=1
    if r.get("draft_title"):drafts+=1
-   vals=(r.get("id"),r.get("celebrity_name") or "-",r.get("event_date") or "날짜미확인",r.get("look_type") or "-",r.get("independent_source_count") or 0,
+   vals=(r.get("id"),r.get("celebrity_name") or "-",r.get("event_date") or "날짜미확인",r.get("look_type") or "-",r.get("source_count") or 0,
          f"{float(r.get('confidence_score') or 0):.0f}",r.get("item_count") or 0,r.get("matched_count") or 0,status or "-")
    try:self.celeb_style_tree.insert("","end",iid=str(r.get("id")),values=vals)
    except Exception:self.celeb_style_tree.insert("","end",values=vals)
-  if hasattr(self,"celeb_style_summary"):self.celeb_style_summary.set(f"후보 {len(rows)} · 분석 {analyzed} · 상품매칭 {matched} · 원고 {drafts}")
+  if hasattr(self,"celeb_style_summary"):self.celeb_style_summary.set(f"현재 페이지 {len(rows)}개 · 분석 {analyzed} · 소개상품 {matched} · 원고 {drafts}")
   try:
    vs=celebrity_style_adapter.vision_status();self.celeb_policy_var.set(vs.get("message") or "Vision 상태 미확인")
   except Exception:pass
@@ -828,16 +957,21 @@ class App(tk.Tk):
   if not ids or not hasattr(self,"celeb_style_detail"):return
   d=celebrity_style_adapter.candidate_detail(ids[0])
   if not d:return
-  lines=[f"[{d.get('celebrity_name')}] {d.get('look_type')} · {d.get('event_date') or '날짜미확인'}",
-         f"상태: {d.get('status')} / 신뢰점수: {float(d.get('confidence_score') or 0):.1f} / 독립출처: {d.get('independent_source_count')}",
+  lines=[f"[{d.get('celebrity_name')}] {d.get('look_type')} · 게시일 {d.get('event_date') or '날짜미확인'}",
+         f"상태: {d.get('status')} / 근거점수: {float(d.get('confidence_score') or 0):.1f} / 출처 수: {d.get('source_count')}",
          "", "■ 착장 아이템"]
   for it in d.get("items") or []:
    exact="정확 제품 주장 가능" if int(it.get("exact_claim_allowed") or 0) else "정확 제품 단정 금지"
    prod=(it.get("matched_name") or "미매칭")+((f" · {int(it.get('matched_price') or 0):,}원") if it.get("matched_price") else "")
    lines.append(f"- {it.get('item_category')}: {it.get('brand') or ''} {it.get('model_name') or ''} {it.get('item_description') or ''} / {it.get('color') or '-'}")
    lines.append(f"  근거={it.get('evidence_level')} {float(it.get('confidence_score') or 0):.0f}점 · {exact} · 상품={it.get('match_type')} · {prod}")
+   if it.get("matched_url"):lines.append(f"  소개 상품 링크: {it.get('matched_url')}")
+   if it.get("matched_price"):lines.append("  가격은 왈라랜드에 게시된 값이며 현재 판매가와 다를 수 있습니다.")
   lines.extend(["", "■ 확인 출처"])
-  for s in (d.get("sources") or [])[:10]:lines.append(f"- [{s.get('source_type')}] {s.get('title') or '-'}\n  {s.get('url') or s.get('naver_url') or ''}")
+  for s in d.get("sources") or []:
+   lines.append(f"- [{s.get('source_type')}] {s.get('title') or '-'}\n  {s.get('url') or s.get('naver_url') or ''}")
+   if s.get("original_source_name") or s.get("original_source_url"):
+    lines.append(f"  왈라랜드가 표기한 원출처: {s.get('original_source_name') or ''}\n  {s.get('original_source_url') or ''}")
   if d.get("vision"):
    v=d.get("vision") or {};lines.extend(["",f"■ Vision 보조: {v.get('model') or '-'} / 시도={v.get('attempted')} / 브랜드 확정용 아님"])
   if d.get("draft_title"):
@@ -856,7 +990,7 @@ class App(tk.Tk):
   ids=self._selected_celebrity_style_ids()
   if not ids:return messagebox.showwarning("선택 필요","작성물로 연동할 착장 후보를 선택하세요.")
   try:
-   r=celebrity_style_adapter.promote_candidate(ids[0]);self.refresh();messagebox.showinfo("작성물 연동",r.get("message")+"\n\n이제 작성물 관리에서 해당 상품을 확인하고, 필요하면 동일상품 사진 3장 → 텍스트/이미지 임시저장을 실행할 수 있습니다.")
+   r=celebrity_style_adapter.promote_candidate(ids[0]);self.refresh();messagebox.showinfo("작성물 연동",r.get("message")+"\n\n작성물 관리에서 출처와 소개 상품을 확인한 뒤 텍스트 임시저장을 실행할 수 있습니다.")
   except Exception as e:messagebox.showerror("작성물 연동 실패",str(e))
 
  def celebrity_style_blog_selected(self):
@@ -912,12 +1046,14 @@ class App(tk.Tk):
 
  def trend_coupang_extract(self):
   if self.worker and self.worker.is_alive():return messagebox.showwarning("실행 중","다른 작업이 실행 중입니다.")
+  try:preferences=self.selected_collection_preferences()
+  except ValueError as exc:return messagebox.showwarning("수집 조건 확인",str(exc))
   self.stop=False
   def job():
    try:
     self.q.put(("trend",2,"트렌드 통합 → 쿠팡 인기상품 추출 준비"))
     def cb(done,total,msg):self.q.put(("trend",int(done/max(1,total)*100),msg))
-    result=trend_coupang_adapter.extract_popular_products(progress=cb)
+    result=trend_coupang_adapter.extract_popular_products(progress=cb,preferences=preferences,stop_check=lambda:self.stop)
     self.q.put(("trend",100,result.get("message") or "트렌드→쿠팡 추출 완료"));self.q.put(("refresh",))
     self.emit("[트렌드→쿠팡] "+str(result.get("message") or result))
    except Exception as e:
@@ -945,19 +1081,21 @@ class App(tk.Tk):
   if hasattr(self,"collect_trend_summary"):
    self.collect_trend_summary.set(f"아이템스카우트 {merged_counts.get('아이템스카우트',0)} · 네이버 데이터랩 {merged_counts.get('네이버데이터랩',0)} · 쿠팡 연결 {linked}")
   self.trend_summary.set(
-   f"아이템스카우트 통합 {merged_counts.get('아이템스카우트',0)} (원본 {raw_counts.get('아이템스카우트',0)}/360) · "
-   f"네이버 데이터랩 통합 {merged_counts.get('네이버데이터랩',0)} (원본 {raw_counts.get('네이버데이터랩',0)}/360)"
+   f"아이템스카우트 보관 {merged_counts.get('아이템스카우트',0)} (원본 {raw_counts.get('아이템스카우트',0)}) · "
+   f"네이버 데이터랩 보관 {merged_counts.get('네이버데이터랩',0)} (원본 {raw_counts.get('네이버데이터랩',0)})"
   )
 
  def trend_collect(self,source):
   if self.worker and self.worker.is_alive():return messagebox.showwarning("실행 중","다른 작업이 실행 중입니다.")
+  try:preferences=self.selected_collection_preferences()
+  except ValueError as exc:return messagebox.showwarning("수집 조건 확인",str(exc))
   self.stop=False
   def job():
    try:
     self.q.put(("trend",2,f"{source} 수집 준비 중"))
     def cb(done,total,msg):
      pct=int(done/max(1,total)*100);self.q.put(("trend",pct,msg))
-    result=trend_collection_adapter.collect_source(source,progress=cb)
+    result=trend_collection_adapter.collect_source(source,progress=cb,preferences=preferences,stop_check=lambda:self.stop)
     self.q.put(("trend",100,result.get("message") or f"{source} 수집 완료"))
     self.q.put(("refresh",));self.emit(f"[추가 트렌드] {source}: {result.get('count',0)}/{result.get('target',360)}")
     if result.get("errors"):self.emit("[추가 트렌드 부분수집] "+" | ".join(result.get("errors")[:12]))
@@ -996,7 +1134,8 @@ class App(tk.Tk):
     iv=int(r["image_verified_count"] or 0) if "image_verified_count" in r.keys() else sum(1 for x in [r["image1"],r["image2"],r["image3"]] if x)
     pv=int(r["price_verified_sites"] or 0) if "price_verified_sites" in r.keys() else sum(1 for x in [r["price_toss"],r["price_coupang"],r["price_naver"]] if x)
     pc=int(r["price_image_verified_sites"] or 0) if "price_image_verified_sites" in r.keys() else 0
-    if int(r["already_posted"] or 0):posted_state="기존게시·"+("수동" if str(r["already_posted_method"] or "")=="MANUAL" else "자동")
+    if str(r["already_posted_method"] or "")=="REGISTRY_DRAFT":posted_state="임시저장 이력"
+    elif int(r["already_posted"] or 0):posted_state="기존게시·"+("수동" if str(r["already_posted_method"] or "")=="MANUAL" else "자동")
     elif int(r["already_posted_review"] or 0):posted_state="자동확인필요"
     elif int(r["already_posted_auto_ignored"] or 0):posted_state="미게시·수동확인"
     else:posted_state="남은 제품"
@@ -1006,38 +1145,40 @@ class App(tk.Tk):
   finally:con.close()
 
  def refresh_sources(self):
+  cats=self.collection_display_preferences.market_categories;target=len(cats)*30
   con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
   try:
    counts={}
    for platform,t in self.source_trees.items():
     for x in t.get_children():t.delete(x)
-    rows=con.execute("SELECT * FROM candidates WHERE platform=? ORDER BY category,rank_no,id",(platform,)).fetchall();counts[platform]=len(rows)
+    rows=con.execute("SELECT * FROM candidates WHERE platform=? ORDER BY category,rank_no,id",(platform,)).fetchall();counts[platform]=sum(r["category"] in cats for r in rows)
     for r in rows:
      price="-" if not r["price"] else f"{int(r['price']):,}원"
      t.insert("","end",values=(r["category"],r["rank_no"],r["name"],price,r["url"] or ""))
-    self.source_count_labels[platform].set(f"{platform.replace('네이버쇼핑','네이버')}: {len(rows)}/180")
+    self.source_count_labels[platform].set(f"{platform.replace('네이버쇼핑','네이버')} 선택 조건: {counts[platform]}/{target}")
     if hasattr(self,"collect_source_metric_vars") and platform in self.collect_source_metric_vars:
-     self.collect_source_metric_vars[platform].set(f"{len(rows)}/180")
+     self.collect_source_metric_vars[platform].set(f"{counts[platform]}/{target}")
   finally:con.close()
   return counts
 
  def refresh_coverage(self,counts=None):
-  counts=counts or {};cfg=settings();cats=cfg.get("categories",[]);plats=["쿠팡","토스쇼핑","네이버쇼핑"]
+  counts=counts or {};cfg=settings();cats=self.collection_display_preferences.market_categories;plats=["쿠팡","토스쇼핑","네이버쇼핑"]
+  target=len(cats)*30;grand_target=target*len(plats)
   con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
-  lines=["[수집 COVERAGE]","540개를 모두 채우지 못해도 실제 확보된 전체 데이터만으로 Top100(100개 미만이면 Top N)을 생성합니다.",""]
+  lines=["[선택 조건 수집 현황]","선택한 카테고리의 실제 확보 데이터로 Top100(100개 미만이면 Top N)을 생성합니다.",""]
   allok=True;grand=0
   try:
    for p in plats:
-    lines.append(f"[{p.replace('네이버쇼핑','네이버')}] target 180")
+    lines.append(f"[{p.replace('네이버쇼핑','네이버')}] target {target}")
     stotal=0
     for cat in cats:
      n=int(con.execute("SELECT COUNT(*) FROM candidates WHERE platform=? AND category=?",(p,cat)).fetchone()[0]);stotal+=n
      ok=n==30;allok=allok and ok;lines.append(f"  {'PASS' if ok else 'FAIL'}  {cat}: {n}/30")
-    grand+=stotal;lines.append(f"  TOTAL: {stotal}/180\n")
+    grand+=stotal;lines.append(f"  TOTAL: {stotal}/{target}\n")
   finally:con.close()
   enough=grand>0
-  state="COMPLETE" if allok and grand==540 else ("PARTIAL ACCEPTED" if enough else "INSUFFICIENT")
-  lines.append(f"GRAND TOTAL: {grand}/540 · {state}")
+  state="COMPLETE" if allok and grand==grand_target else ("PARTIAL ACCEPTED" if enough else "INSUFFICIENT")
+  lines.append(f"GRAND TOTAL: {grand}/{grand_target} · {state}")
   out=ROOT/"outputs"/"strict540_category_coverage.json"
   if out.exists():
    try:
@@ -1066,7 +1207,7 @@ class App(tk.Tk):
     if bad:lines.extend(["","실패 화면 진단:"]+bad[:54])
    except Exception:pass
   self.coverage_text.delete("1.0","end");self.coverage_text.insert("1.0","\n".join(lines))
-  self.collect_summary.set(f"원천 {grand}/540 ({state}) · 쿠팡 {counts.get('쿠팡',0)}/180 · 토스 {counts.get('토스쇼핑',0)}/180 · 네이버 {counts.get('네이버쇼핑',0)}/180 · TOP {self._top_product_count()}/100")
+  self.collect_summary.set(f"선택 조건 {grand}/{grand_target} ({state}) · 쿠팡 {counts.get('쿠팡',0)}/{target} · 토스 {counts.get('토스쇼핑',0)}/{target} · 네이버 {counts.get('네이버쇼핑',0)}/{target} · TOP {self._top_product_count()}/100")
 
  def open_collection_diagnostics(self):
   p=ROOT/"evidence"/"collection_540";p.mkdir(parents=True,exist_ok=True)
@@ -1169,10 +1310,11 @@ class App(tk.Tk):
  def image_repairs_only(self):
   """Run stage ③ only for rows with missing physical image files."""
   if self.worker and self.worker.is_alive():return messagebox.showwarning("실행 중","다른 작업이 실행 중입니다.")
+  self.stop=False
   def job():
    try:
     self.q.put(("step","images","사진 보강 대상 확인 중",5));self.emit("사진 보강 대상만 재시도 시작")
-    result=image_adapter.run_repairs(progress=self.progress("images"))
+    result=image_adapter.run_repairs(context={"stop_check":lambda:self.stop},progress=self.progress("images"))
     ok=bool(result.get("stage_ok",True));msg=str(result.get("message") or "사진 보강 완료")
     self.q.put(("step","images","완료" if ok else msg,100));self.q.put(("refresh",));self.emit(msg)
    except Exception as e:
@@ -1182,12 +1324,11 @@ class App(tk.Tk):
  def sharelink_images_only(self):
   """Generate affiliate links only after all three product images are verified."""
   if self.worker and self.worker.is_alive():return messagebox.showwarning("실행 중","다른 작업이 실행 중입니다.")
+  self.stop=False
   def job():
    try:
-    h=coupang_sharelink_adapter.health()
-    if not h.get("ready"):raise RuntimeError(h.get("message") or "쿠팡 Partners API 키가 필요합니다.")
     self.q.put(("step","content","사진3장 성공 상품 쉐어링크 확인 중",5));self.emit("사진3장 성공 상품만 쿠팡 쉐어링크 생성 시작")
-    result=coupang_sharelink_adapter.run(progress=self.progress("content"))
+    result=coupang_sharelink_adapter.run(progress=self.progress("content"),stop_check=lambda:self.stop)
     ok=bool(result.get("stage_ok",True));msg=str(result.get("message") or "쉐어링크 처리 완료")
     self.q.put(("step","content","쉐어링크 완료" if ok else msg,100));self.q.put(("refresh",));self.emit(msg)
    except Exception as e:
@@ -1201,7 +1342,8 @@ class App(tk.Tk):
   def job():
    try:
     self.emit("선택 상품 안전 가격 재검증 시작 · 추가 쇼핑검색 0회 기본")
-    price_adapter.verify_product(pid,progress=self.progress("price"));self.q.put(("refresh",));self.emit("선택 상품 안전 가격 재검증 완료")
+    result=price_adapter.verify_product(pid,progress=self.progress("price"));self.q.put(("refresh",))
+    self.emit(str(result.get("reason") or "선택 상품 가격 검증 생략") if result.get("skipped") else "선택 상품 안전 가격 재검증 완료")
    except Exception as e:self.emit("선택 상품 가격 검증 실패: "+str(e))
   self.worker=threading.Thread(target=job,daemon=True);self.worker.start()
 
@@ -1213,7 +1355,8 @@ class App(tk.Tk):
   def job():
    try:
     self.emit("선택 상품 1개 라이브 가격 갱신 시작")
-    price_adapter.verify_product_live_browser(pid,progress=self.progress("price"));self.q.put(("refresh",));self.emit("선택 상품 라이브 가격 갱신 완료")
+    result=price_adapter.verify_product_live_browser(pid,progress=self.progress("price"));self.q.put(("refresh",))
+    self.emit(str(result.get("reason") or "선택 상품 가격 검증 생략") if result.get("skipped") else "선택 상품 라이브 가격 갱신 완료")
    except Exception as e:self.emit("라이브 가격 갱신 실패: "+str(e))
   threading.Thread(target=job,daemon=True).start()
 
@@ -1411,6 +1554,7 @@ class App(tk.Tk):
    messagebox.showinfo("완료/미완료 분류표",str(path))
 
  def existing_post_selected(self,posted):
+  if not self.require_target_blog():return
   ids=[int(value) for value in self.tree.selection() if str(value).isdigit()]
   if not ids:return messagebox.showwarning("제품 선택 필요","상품/진행현황 목록에서 제품을 하나 이상 선택하세요. Ctrl 키로 여러 제품을 선택할 수 있습니다.")
   action="기존 게시완료로 표시" if posted else "게시완료 표시를 해제하고 자동대조 대상에서도 제외"
@@ -1423,16 +1567,13 @@ class App(tk.Tk):
   except Exception as e:messagebox.showerror("수동 게시 구분 실패",str(e))
 
  def existing_post_auto(self):
+  if not self.require_target_blog():return
   state=external_batch_import.selected_state()
-  if not state.get("batch_id"):return messagebox.showwarning("선택된 폴더 없음","먼저 외부 원고 폴더 또는 ZIP을 가져오세요.")
-  saved=str(already_posted_adapter.load_config().get("blog_id") or "")
-  value=simpledialog.askstring("네이버 기존글 자동대조","본인 네이버 블로그 ID 또는 blog.naver.com 주소를 입력하세요.\n공개 RSS 제목만 읽으며 글을 열거나 수정하지 않습니다.",initialvalue=saved,parent=self)
-  if value is None:return
-  try:blog_id=already_posted_adapter.save_blog_id(value)
+  try:blog_id=already_posted_adapter.save_blog_id(blog_target.get_target_blog_id())
   except Exception as e:return messagebox.showerror("블로그 ID 오류",str(e))
   if self.worker and self.worker.is_alive():return messagebox.showwarning("실행 중","다른 작업이 실행 중입니다.")
   self.already_posted_info.set("네이버 공개 RSS에서 기존 게시글 제목을 가져와 대조하고 있습니다…")
-  self.worker=threading.Thread(target=self._existing_post_auto_work,args=(blog_id,state["batch_id"]),daemon=True);self.worker.start()
+  self.worker=threading.Thread(target=self._existing_post_auto_work,args=(blog_id,str(state.get("batch_id") or "")),daemon=True);self.worker.start()
 
  def _existing_post_auto_work(self,blog_id,batch_id):
   try:
@@ -1444,13 +1585,13 @@ class App(tk.Tk):
   except Exception as e:self.q.put(("existing_post_error",str(e)))
 
  def existing_post_file(self):
+  if not self.require_target_blog():return
   state=external_batch_import.selected_state()
-  if not state.get("batch_id"):return messagebox.showwarning("선택된 폴더 없음","먼저 외부 원고 폴더 또는 ZIP을 가져오세요.")
   path=filedialog.askopenfilename(title="이미 게시한 글 제목 파일 선택",filetypes=[("제목 파일","*.txt *.csv *.json"),("텍스트","*.txt"),("CSV","*.csv"),("JSON","*.json")])
   if not path:return
   if self.worker and self.worker.is_alive():return messagebox.showwarning("실행 중","다른 작업이 실행 중입니다.")
   self.already_posted_info.set("선택한 제목 파일과 외부 원고 제품을 대조하고 있습니다…")
-  self.worker=threading.Thread(target=self._existing_post_file_work,args=(path,state["batch_id"]),daemon=True);self.worker.start()
+  self.worker=threading.Thread(target=self._existing_post_file_work,args=(path,str(state.get("batch_id") or "")),daemon=True);self.worker.start()
 
  def _existing_post_file_work(self,path,batch_id):
   try:
@@ -1616,8 +1757,11 @@ class App(tk.Tk):
   return cb
  def single(self,k):
   if self.worker and self.worker.is_alive():return messagebox.showwarning("실행 중","다른 작업이 실행 중입니다.")
+  if k=="blog" and not self.require_target_blog():return
+  try:preferences=self.selected_collection_preferences() if k=="search" else None
+  except ValueError as exc:return messagebox.showwarning("수집 조건 확인",str(exc))
   self.stop=False
-  self.worker=threading.Thread(target=self.work,args=([k],),daemon=True);self.worker.start()
+  self.worker=threading.Thread(target=self.work,args=([k],),kwargs={"collection_snapshot":preferences},daemon=True);self.worker.start()
  def content_force_regenerate(self):
   if self.worker and self.worker.is_alive():return messagebox.showwarning("실행 중","다른 작업이 실행 중입니다.")
   if not messagebox.askyesno("Ollama 전체 재생성","현재 완료 원고까지 포함해 제목·본문·태그를 Ollama 무료 로컬 AI 방식으로 다시 만들까요?\n\n기존 이미지와 제휴링크는 건드리지 않습니다."):
@@ -1627,12 +1771,16 @@ class App(tk.Tk):
 
  def blog_single(self,mode,force_retry=False,blog_context=None):
   if self.worker and self.worker.is_alive():return messagebox.showwarning("실행 중","다른 작업이 실행 중입니다.")
+  if not self.require_target_blog():return
   self.stop=False
   self.worker=threading.Thread(target=self.work,args=(["blog"],mode,force_retry,blog_context),daemon=True);self.worker.start()
  def runall(self):
   if self.worker and self.worker.is_alive():return messagebox.showwarning("실행 중","이미 실행 중입니다.")
-  self.stop=False;self.worker=threading.Thread(target=self.work,args=([x[0] for x in STEPS],),daemon=True);self.worker.start()
- def work(self,keys,blog_mode=None,blog_force_retry=False,blog_context=None,content_context=None):
+  if not self.require_target_blog():return
+  try:preferences=self.selected_collection_preferences()
+  except ValueError as exc:return messagebox.showwarning("수집 조건 확인",str(exc))
+  self.stop=False;self.worker=threading.Thread(target=self.work,args=([x[0] for x in STEPS],),kwargs={"collection_snapshot":preferences},daemon=True);self.worker.start()
+ def work(self,keys,blog_mode=None,blog_force_retry=False,blog_context=None,content_context=None,collection_snapshot:collection_preferences.CollectionPreferences|None=None):
   pending=False;self.active_progress_map={k:(idx,len(keys)) for idx,k in enumerate(keys)}
   for idx,k in enumerate(keys):
    if self.stop:break
@@ -1646,13 +1794,18 @@ class App(tk.Tk):
      if k=="blog":
       context={"mode":blog_mode or settings().get("blog_default_mode","images_only"),"force_retry":bool(blog_force_retry)}
       context.update(blog_context or {})
+      context["stop_check"]=lambda:self.stop
       result=mod.run(context=context,progress=self.progress(k))
      elif k=="content":
       content_ctx=dict(content_context or {})
       content_ctx["_live_progress"]=self.content_live_progress
       content_ctx["_cancel_check"]=lambda:self.stop
       result=mod.run(context=content_ctx,progress=self.progress(k))
+     elif k=="search":result=search_adapter.discover(progress=self.progress(k),preferences=collection_snapshot,stop_check=lambda:self.stop)
+     elif k=="images":result=image_adapter.run(context={"stop_check":lambda:self.stop},progress=self.progress(k))
      else:result=mod.run(progress=self.progress(k))
+    if isinstance(result,dict) and result.get("stopped"):
+     self.stop=True;self.q.put(("step",k,"사용자 요청으로 중지",0));break
     stage_ok=not isinstance(result,dict) or result.get("stage_ok",True)
     if stage_ok:
      self.q.put(("step",k,"완료",100));self.emit(label+" 완료")
@@ -1678,6 +1831,8 @@ class App(tk.Tk):
     self.q.put(("refresh",))
    except Exception as e:
     self.q.put(("step",k,"실패",0));self.emit(label+" 실패: "+str(e));self.q.put(("refresh",));self.q.put(("total",int(idx/len(keys)*100),label+" 실패 — 실행 로그/진단 파일 확인"));return
+  if self.stop:
+   self.q.put(("total",0,"사용자 요청으로 실행 중지"));self.q.put(("refresh",));return
   try:
    self._maybe_video_after_pipeline()
   except Exception as e:self.emit("AI영상 선택단계 실패: "+str(e))
@@ -1693,9 +1848,12 @@ class App(tk.Tk):
    if iv<3 or physical<3:errs.append(f"사진{min(iv,physical)}/3")
    taglist=[x.strip() for x in str(r["tags"] or "").split(",") if x.strip()]
    seo_audit=content_adapter.seo_token_audit(str(r["title"] or ""),taglist,str(r["name"] or ""))
-   if len(taglist)!=int(settings().get("tags_count",30)):errs.append(f"태그{len(taglist)}/{int(settings().get('tags_count',30))}")
-   if seo_audit.get("title_duplicate_words"):errs.append("제목단어중복:"+"/".join(seo_audit["title_duplicate_words"][:4]))
-   if seo_audit.get("tag_duplicate_words"):errs.append("태그단어중복:"+"/".join(seo_audit["tag_duplicate_words"][:4]))
+   tag_reason=blog_tag_policy.tag_requirement_reason(r)
+   if tag_reason:errs.append(tag_reason)
+   title_duplicates=seo_audit.get("title_duplicate_words")
+   tag_duplicates=seo_audit.get("tag_duplicate_words")
+   if isinstance(title_duplicates,list) and title_duplicates:errs.append("제목단어중복:"+"/".join(title_duplicates[:4]))
+   if isinstance(tag_duplicates,list) and tag_duplicates:errs.append("태그단어중복:"+"/".join(tag_duplicates[:4]))
    if seo_audit.get("banned_tags"):errs.append("태그노이즈")
    # v7.58 strict Naver SEO audit: title must keep 추천｜, actual autocomplete
    # words must flow into title, four heart headings, their paragraphs, and tags.
@@ -1740,6 +1898,7 @@ class App(tk.Tk):
           "message":"QA 전상품 통과" if failed==0 else f"QA 보완 필요 {failed}건 — 미완료 상품은 블로그 임시저장 대상에서 제외됩니다."}
 
  def refresh(self):
+  already_posted_adapter.activate_blog_scope()
   self.refresh_external_batch_state()
   self.refresh_top100()
   counts=self.refresh_sources()
