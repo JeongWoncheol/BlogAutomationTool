@@ -2,7 +2,10 @@
 from pathlib import Path
 import os,json,time,re,ctypes,sqlite3,traceback,hashlib,subprocess,html as _html
 from .common import *
-from .published_product_registry import record_published_product
+from .published_product_registry import record_published_product, find_published_match
+from .already_posted_adapter import activate_blog_scope
+from .blog_target import require_target_blog_id, write_url, assert_editor_target
+from .blog_tag_policy import tag_requirement_reason
 try:
  from selenium import webdriver
  from selenium.webdriver.common.by import By
@@ -128,7 +131,7 @@ def _frame_path_here(d):
   return str(d.execute_script("const f=window.frameElement;return f?((f.id||f.name||f.className||'frame')):'top';") or 'top')
  except Exception:return 'unknown'
 
-def wait_frame(d,timeout=35):
+def wait_frame(d,timeout: float=35):
  """Discover the real SmartEditor host document dynamically.
 
  The old fixed ``#mainFrame`` wait is exactly why v8.08.13 could open the write
@@ -3969,8 +3972,8 @@ def _physical_images(row):
 
 BLOG_HISTORY_PATH=DATA/"blog_upload_history.json"
 
-def _post_fingerprint(row,mode):
- payload={"mode":mode,"title":str(row["title"] or ""),"body":str(row["body"] or ""),"tags":str(row["tags"] or "")}
+def _post_fingerprint(row,mode,blog_id=None):
+ payload={"blog_id":require_target_blog_id() if blog_id is None else blog_id,"mode":mode,"title":str(row["title"] or ""),"body":str(row["body"] or ""),"tags":str(row["tags"] or "")}
  raw=json.dumps(payload,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode("utf-8")
  return hashlib.sha256(raw).hexdigest()
 
@@ -3991,14 +3994,13 @@ def _save_blog_history(hist):
 def _dedupe_upload_rows(rows,mode):
  """Prevent the same exact article from being drafted twice across retries or repeated button clicks."""
  history=_load_blog_history();seen=set();out=[];skipped=[]
- if not bool(settings().get("blog_skip_duplicate_drafts",True)):return list(rows),skipped,history
  done_status={"images_only":"임시저장완료(사진3장)","price_complete":"임시저장완료(3사가격)","text_only":"임시저장완료(텍스트)"}.get(mode,"임시저장완료(사진3장)")
  for row in rows:
   fp=_post_fingerprint(row,mode)
   if fp in seen:
    skipped.append({"id":row["id"],"name":row["name"],"reasons":["동일 원고 중복 방지(현재 실행)"]});continue
   seen.add(fp)
-  if str(row["status"] or "")==done_status or fp in history:
+  if fp in history or find_published_match(row["name"],row["source_url"] or ""):
    skipped.append({"id":row["id"],"name":row["name"],"reasons":["이미 임시저장 완료된 동일 원고"]});continue
   out.append(row)
  return out,skipped,history
@@ -4019,7 +4021,7 @@ def _eligible_rows(con,mode,context=None):
  for row in rows:
   reasons=[];images=_physical_images(row)
   if not row["title"] or not row["body"] or not row["tags"]:reasons.append("원고 미완료")
-  elif len([x for x in re.split(r"[,\n]+",str(row["tags"] or "")) if x.strip()])<max(20,int(settings().get("seo_min_related_tags",20))):reasons.append("관련 태그 20개 미만")
+  elif tag_requirement_reason(row):reasons.append(tag_requirement_reason(row))
   if mode!="text_only":
    image_ok,image_detail=verified_blog_image_set(row,3)
    if not image_ok:reasons.append(image_detail.get("reason") or f"제품 이미지 {len(images)}/3")
@@ -4228,11 +4230,14 @@ def _write_one_post(d,r,mode):
  _set_exact_phase(d,top,'글쓰기 페이지 이동')
  try:d.maximize_window()
  except Exception:pass
- d.get(WRITE_URL);time.sleep(2.2)
+ target=require_target_blog_id()
+ d.get(write_url());time.sleep(2.2)
  _win_foreground_chrome(d)
  if "nid.naver.com" in d.current_url:
   raise RuntimeError("네이버 로그인이 필요합니다. 자동화 전 전용 Chrome 프로필에 로그인하세요.")
- wait_frame(d,timeout=float(settings().get('blog_editor_ready_timeout_sec',50)));cancel_existing(d);wait_frame(d,timeout=20)
+ wait_frame(d,timeout=float(settings().get('blog_editor_ready_timeout_sec',50)))
+ assert_editor_target(d,target)
+ cancel_existing(d);wait_frame(d,timeout=20)
  _set_exact_phase(d,top,'제목 입력')
  title(d,post["title"]);log(f"네이버 작성 TOP{top}: 제목 입력/검증 완료 · 동일 편집기 문서 유지")
  _set_exact_phase(d,top,'본문 초기화·포커스')
@@ -4280,6 +4285,8 @@ def _write_one_post(d,r,mode):
  _validate_body_complete(d,post);validate(d,len(imgs));_validate_tags_complete(d,post.get("tags",[]))
  log(f"네이버 작성 TOP{top}: 본문/이미지/서식/태그 최종검증 통과 · 임시저장 진행")
  _set_exact_phase(d,top,'임시저장')
+ wait_frame(d,timeout=20)
+ assert_editor_target(d,target)
  if not draft(d,expected_images=len(imgs)):raise RuntimeError("임시저장 확인 실패")
  _set_exact_phase(d,top,'임시저장 확인완료')
  return {"images":len(imgs),"body":True,"styles":True,"tags":True,"draft":True}
@@ -4299,6 +4306,9 @@ def _recycle_driver_between_posts(d,reason):
 
 def run(context=None,progress=None):
  ctx=dict(context or {});mode=str(ctx.get("mode") or settings().get("blog_default_mode","images_only"))
+ target=require_target_blog_id();activate_blog_scope()
+ stop_check=ctx.get("stop_check")
+ if callable(stop_check) and stop_check():return {"processed":0,"stage_ok":False,"stopped":True,"message":"블로그 저장 중지"}
  if mode not in {"images_only","price_complete","text_only"}:mode="images_only"
  con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
  repair=_rebase_local_artifacts(con)
@@ -4310,13 +4320,18 @@ def run(context=None,progress=None):
   msg=f"{label} 신규 임시저장 대상 0건 · 동일 원고/조건 미달 {len(skipped)}건"
   if unresolved:msg+=f" · 로컬 이미지 경로 미해결 {unresolved}건"
   log("네이버 Chrome 미실행: "+msg)
-  return {"processed":0,"stage_ok":unresolved==0,"soft_pending":bool(unresolved),"mode":mode,"skipped":skipped,"message":msg}
+  pending=bool(unresolved) or any(any("이미 임시저장 완료" not in reason and "동일 원고 중복" not in reason for reason in item["reasons"]) for item in skipped)
+  return {"processed":0,"stage_ok":not pending,"soft_pending":pending,"mode":mode,"skipped":skipped,"message":msg}
 
  cfg=settings();retry_count=max(1,int(cfg.get("blog_upload_retry_count",2)));keep_on_failure=bool(cfg.get("blog_keep_browser_open_on_failure",True))
- diagnostics=[];successes=0;failed=[];d=None
+ diagnostics=[];successes=0;failed=[];d=None;stopped=False
  try:
   d=start_driver()
   for idx,r in enumerate(rows):
+   if find_published_match(r["name"],r["source_url"] or "",blog_id=target):
+    skipped.append({"id":r["id"],"name":r["name"],"reasons":["이미 임시저장 완료된 동일 상품"]});continue
+   if callable(stop_check) and stop_check():stopped=True;break
+   if require_target_blog_id()!=target:raise RuntimeError("실행 중 대상 블로그 변경 감지")
    ok=False;last_error=""
    for attempt in range(1,retry_count+1):
     try:
@@ -4339,11 +4354,11 @@ def run(context=None,progress=None):
    if ok:
     saved_status={"images_only":"임시저장완료(사진3장)","price_complete":"임시저장완료(3사가격)","text_only":"임시저장완료(텍스트)"}.get(mode,"임시저장완료(사진3장)")
     con.execute("UPDATE products SET status=?,last_error=NULL,updated_at=datetime('now','localtime') WHERE id=?",(saved_status,r["id"]));con.commit();successes+=1
-    saved_at=time.strftime("%Y-%m-%d %H:%M:%S");fp=_post_fingerprint(r,mode)
-    history[fp]={"product_id":r["id"],"product_no":r["product_no"],"name":r["name"],"source_url":r["source_url"] or "","mode":mode,"saved_at":saved_at}
+    saved_at=time.strftime("%Y-%m-%d %H:%M:%S");fp=_post_fingerprint(r,mode,blog_id=target)
+    history[fp]={"blog_id":target,"product_id":r["id"],"product_no":r["product_no"],"name":r["name"],"source_url":r["source_url"] or "","mode":mode,"saved_at":saved_at}
     _save_blog_history(history)
     try:
-     record_published_product(r,mode,fp,saved_at)
+     record_published_product(r,mode,fp,saved_at,blog_id=target)
      log(f"게시완료 상품 중복 레지스트리 기록: {r['name']}")
     except Exception as exc:log("게시완료 상품 중복 레지스트리 기록 경고: "+str(exc))
     if progress:progress(idx+1,len(rows),f"임시저장 확인완료: {r['name'][:30]}")
@@ -4377,6 +4392,7 @@ def run(context=None,progress=None):
   con.close()
 
  label={"images_only":"사진 3장 기준","price_complete":"3사 가격 비교 기준","text_only":"텍스트만 기준"}.get(mode,"사진 3장 기준")
+ if stopped:return {"processed":successes,"stage_ok":False,"stopped":True,"mode":mode,"message":f"블로그 저장 중지 · {successes}건 저장 완료"}
  if failed:
   return {"processed":successes,"failed":failed,"stage_ok":False,"soft_pending":True,"mode":mode,"skipped":skipped,
           "diagnostic_csv":str(OUTPUTS/"blog_upload_diagnostic.csv"),

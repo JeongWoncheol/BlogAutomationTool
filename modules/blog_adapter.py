@@ -2,7 +2,10 @@
 from pathlib import Path
 import os,json,time,re,ctypes,sqlite3,traceback,hashlib,threading,subprocess,urllib.parse,importlib
 from .common import *
-from .published_product_registry import record_published_product
+from .published_product_registry import record_published_product, find_published_match
+from .already_posted_adapter import activate_blog_scope
+from .blog_target import require_target_blog_id, write_url, assert_editor_target
+from .blog_tag_policy import tag_requirement_reason
 try:
  from selenium import webdriver
  from selenium.webdriver.common.by import By
@@ -159,7 +162,7 @@ def _wait_for_naver_login_if_needed(d):
  while time.time()<end:
   try:
    if "nid.naver.com" not in str(d.current_url or ""):
-    _navigate_same_tab(d,WRITE_URL);return True
+    _navigate_same_tab(d,write_url());return True
   except Exception:pass
   time.sleep(.5)
  raise RuntimeError("네이버 로그인 대기 시간초과. 열린 자동화 Chrome에서 로그인한 뒤 임시저장을 다시 실행하세요.")
@@ -2670,8 +2673,8 @@ def _row_value(row,key,default=""):
   try:return row.get(key,default)
   except Exception:return default
 
-def _post_fingerprint(row,mode):
- payload={"mode":mode,"title":str(_row_value(row,"title","") or ""),"body":str(_row_value(row,"body","") or ""),"tags":str(_row_value(row,"tags","") or ""),"sharelink":str(_row_value(row,"sharelink","") or "")}
+def _post_fingerprint(row,mode,blog_id=None):
+ payload={"blog_id":require_target_blog_id() if blog_id is None else blog_id,"mode":mode,"title":str(_row_value(row,"title","") or ""),"body":str(_row_value(row,"body","") or ""),"tags":str(_row_value(row,"tags","") or ""),"sharelink":str(_row_value(row,"sharelink","") or "")}
  raw=json.dumps(payload,ensure_ascii=False,sort_keys=True,separators=(",",":")).encode("utf-8")
  return hashlib.sha256(raw).hexdigest()
 
@@ -2692,7 +2695,6 @@ def _save_blog_history(hist):
 def _dedupe_upload_rows(rows,mode,force_retry=False):
  """Prevent the same exact article from being drafted twice across retries or repeated button clicks."""
  history=_load_blog_history();seen=set();out=[];skipped=[]
- if not bool(settings().get("blog_skip_duplicate_drafts",True)) and not force_retry:return list(rows),skipped,history
  done_status={"images_only":"임시저장완료(사진3장)","price_complete":"임시저장완료(3사가격)",
               "text_only":"임시저장완료(제목본문태그)"}.get(mode,"임시저장완료")
  for row in rows:
@@ -2700,7 +2702,7 @@ def _dedupe_upload_rows(rows,mode,force_retry=False):
   if fp in seen:
    skipped.append({"id":row["id"],"product_no":_row_value(row,"product_no",row["id"]),"name":row["name"],"reasons":["동일 원고 중복 방지(현재 실행)"]});continue
   seen.add(fp)
-  if not force_retry and (str(row["status"] or "")==done_status or fp in history):
+  if find_published_match(row["name"],row["source_url"] or "") or (not force_retry and fp in history):
    skipped.append({"id":row["id"],"product_no":_row_value(row,"product_no",row["id"]),"name":row["name"],"reasons":["이미 임시저장 완료된 동일 원고"]});continue
   out.append(row)
  return out,skipped,history
@@ -2851,8 +2853,7 @@ def _eligible_rows(con,mode,context=None):
  for row in rows:
   reasons=[];images=_physical_images(row)
   if not row["title"] or not row["body"] or not row["tags"]:reasons.append("원고 미완료")
-  elif len([x for x in re.split(r"[,\n]+",str(row["tags"] or "")) if x.strip()])<max(20,int(settings().get("seo_min_related_tags",20))):
-   reasons.append("관련 태그 20개 미만")
+  elif tag_requirement_reason(row):reasons.append(tag_requirement_reason(row))
   post=None
   if not reasons:
    post,recovery_reason=_ensure_post_artifact(con,row)
@@ -2988,15 +2989,16 @@ def _set_upload_phase(d,top,phase):
  log(f"네이버 작성 TOP{top}: 단계={phase}")
 
 def _write_one_post_modern(d,r,mode,already_navigated=False):
+ target=require_target_blog_id()
  pdir=Path(r["post_dir"]);post=_post_for_mode(r,mode)
  top=r['product_no'] or r['id'];_set_upload_phase(d,top,"글쓰기 페이지 이동")
  if not already_navigated:
   log(f"네이버 작성 시작 TOP{r['product_no'] or r['id']}: 글쓰기 페이지 이동")
-  _navigate_same_tab(d,WRITE_URL);time.sleep(3.0)
+  _navigate_same_tab(d,write_url());time.sleep(3.0)
   _wait_for_naver_login_if_needed(d)
  else:
   log(f"네이버 작성 시작 TOP{r['product_no'] or r['id']}: 이미 열린 글쓰기 페이지에서 v7.81 fallback")
- wait_frame(d);cancel_existing(d);wait_frame(d)
+ wait_frame(d);assert_editor_target(d,target);cancel_existing(d);wait_frame(d)
  # Critical v8.08.12 gate: prove the body can accept and undo a test edit BEFORE
  # the real title is written.  If Naver changes the editor DOM again, the job
  # stops on a completely blank article instead of leaving the user with the
@@ -3042,6 +3044,8 @@ def _write_one_post_modern(d,r,mode,already_navigated=False):
  _set_upload_phase(d,top,"임시저장")
  log(f"네이버 작성 TOP{r['product_no'] or r['id']}: 제목·본문·태그 최종 확인 · 임시저장")
  # Saving while the red '업로드 중에는...' toast is present is forbidden.
+ wait_frame(d)
+ assert_editor_target(d,target)
  if not draft(d,expected_images=len(imgs)):raise RuntimeError("임시저장 확인 실패")
  _set_upload_phase(d,top,"임시저장 확인완료")
  return len(imgs)
@@ -3102,16 +3106,17 @@ def _write_one_post_v759_compat(d,r,mode,already_navigated=False):
  the path known to work on the user's current Naver editor/account.
  """
  from . import blog_adapter_v759_compat as legacy
+ target=require_target_blog_id()
  pdir=Path(r["post_dir"]);post=_post_for_mode(r,mode)
  top=r['product_no'] or r['id']
  if not already_navigated:
   log(f"네이버 작성 시작 TOP{top}: 글쓰기 페이지 이동 · v7.59 호환 트랜잭션")
-  _navigate_same_tab(d,WRITE_URL);time.sleep(3.0)
+  _navigate_same_tab(d,write_url());time.sleep(3.0)
   _wait_for_naver_login_if_needed(d)
  else:
   log(f"네이버 작성 시작 TOP{top}: 열린 글쓰기 페이지 · v7.59 호환 트랜잭션")
  # From this point through draft save, stay on the v7.59 interaction model.
- legacy.wait_frame(d);legacy.cancel_existing(d);legacy.wait_frame(d)
+ legacy.wait_frame(d);assert_editor_target(d,target);legacy.cancel_existing(d);legacy.wait_frame(d)
  log(f"네이버 작성 TOP{top}: v7.59 mainFrame 고정 · 제목 입력")
  legacy.title(d,post["title"])
  log(f"네이버 작성 TOP{top}: 제목 완료 · 프레임 재초기화 없이 동일 mainFrame 유지")
@@ -3134,6 +3139,8 @@ def _write_one_post_v759_compat(d,r,mode,already_navigated=False):
  close_file_dialogs()
  log(f"네이버 작성 TOP{top}: v7.59 저장 트랜잭션으로 임시저장")
  try:
+  legacy.wait_frame(d)
+  assert_editor_target(d,target)
   if not legacy.draft(d,expected_images=len(imgs)):raise RuntimeError("임시저장 확인 실패")
  except legacy.DraftSaveAmbiguousError as e:
   raise DraftSaveAmbiguousError(str(e))
@@ -3151,7 +3158,7 @@ def _write_one_post(d,r,mode):
  if preferred in ("v759","v759_preferred","legacy","compat"):
   top=r['product_no'] or r['id']
   log(f"네이버 작성 시작 TOP{top}: 글쓰기 페이지 이동 · 작성기 선택 전")
-  _navigate_same_tab(d,WRITE_URL);time.sleep(3.0)
+  _navigate_same_tab(d,write_url());time.sleep(3.0)
   _wait_for_naver_login_if_needed(d)
   probe=float(cfg.get("blog_v759_mainframe_probe_sec",8))
   if _v759_mainframe_available(d,timeout=probe):
@@ -3162,6 +3169,7 @@ def _write_one_post(d,r,mode):
  return _write_one_post_modern(d,r,mode)
 
 def _run_v782_modern(context=None,progress=None):
+ target=require_target_blog_id();activate_blog_scope()
  ctx=dict(context or {});mode=str(ctx.get("mode") or settings().get("blog_default_mode","images_only"))
  force_retry=bool(ctx.get("force_retry",False))
  if mode not in {"images_only","price_complete","text_only"}:mode="images_only"
@@ -3196,6 +3204,9 @@ def _run_v782_modern(context=None,progress=None):
   d=start_driver()
   _ensure_one_valid_window(d)
   for idx,r in enumerate(rows):
+   if require_target_blog_id()!=target:raise RuntimeError("실행 중 대상 블로그 변경 감지")
+   if find_published_match(r["name"],r["source_url"] or "",blog_id=target):
+    skipped.append({"id":r["id"],"name":r["name"],"reasons":["이미 임시저장 완료된 동일 상품"]});continue
    ok=False;last_error=""
    for attempt in range(1,retry_count+1):
     try:
@@ -3224,11 +3235,11 @@ def _run_v782_modern(context=None,progress=None):
     saved_status={"images_only":"임시저장완료(사진3장)","price_complete":"임시저장완료(3사가격)",
                   "text_only":"임시저장완료(제목본문태그)"}[mode]
     con.execute("UPDATE products SET status=?,last_error=NULL,updated_at=datetime('now','localtime') WHERE id=?",(saved_status,r["id"]));con.commit();successes+=1
-    saved_at=time.strftime("%Y-%m-%d %H:%M:%S");fp=_post_fingerprint(r,mode)
-    history[fp]={"product_id":r["id"],"product_no":r["product_no"],"name":r["name"],"source_url":r["source_url"] or "","mode":mode,"saved_at":saved_at}
+    saved_at=time.strftime("%Y-%m-%d %H:%M:%S");fp=_post_fingerprint(r,mode,blog_id=target)
+    history[fp]={"blog_id":target,"product_id":r["id"],"product_no":r["product_no"],"name":r["name"],"source_url":r["source_url"] or "","mode":mode,"saved_at":saved_at}
     _save_blog_history(history)
     try:
-     record_published_product(r,mode,fp,saved_at)
+     record_published_product(r,mode,fp,saved_at,blog_id=target)
      log(f"게시완료 상품 중복 레지스트리 기록: {r['name']}")
     except Exception as exc:log("게시완료 상품 중복 레지스트리 기록 경고: "+str(exc))
     if progress:progress(idx+1,len(rows),f"임시저장 확인완료: {r['name'][:30]}")
@@ -3296,6 +3307,9 @@ def _prepare_exact_v759_artifacts():
 
 def run(context=None,progress=None):
  ctx=dict(context or {})
+ require_target_blog_id();activate_blog_scope()
+ stop_check=ctx.get("stop_check")
+ if callable(stop_check) and stop_check():return {"processed":0,"stage_ok":False,"stopped":True,"message":"블로그 저장 중지"}
  mode=str(ctx.get("mode") or settings().get("blog_default_mode","images_only"))
  if mode not in {"images_only","price_complete","text_only"}:
   mode="images_only"

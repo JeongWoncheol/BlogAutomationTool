@@ -12,6 +12,8 @@ Only confirmed draft saves are recorded.  Failed and ambiguous saves never call
 """
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+from collections.abc import Sequence
+from typing import TypedDict
 import hashlib, json, os, re, sqlite3, threading, time
 
 from .common import (
@@ -20,8 +22,33 @@ from .common import (
 )
 
 REGISTRY_PATH=DATA/"published_product_registry.json"
-REGISTRY_VERSION=1
+REGISTRY_VERSION=2
 _LOCK=threading.RLock()
+
+
+class RegistryRecord(TypedDict, total=False):
+    key: str
+    name: str
+    blog_id: str
+    canonical: str
+    base_canonical: str
+    terms: list[str]
+    critical: list[str]
+    models: list[str]
+    core_compact: str
+    source_ids: list[str]
+    sources: list[str]
+    last_saved_at: str
+    matched_post_titles: list[str]
+    matched_post_urls: list[str]
+
+
+class SourcePost(TypedDict, total=False):
+    title: str
+    url: str
+    source: str
+    blog_id: str
+    published_at: str
 
 _CORE_GENERIC={
     "제품","상품","정품","공식","추천","단품","세트","구성","선택","옵션",
@@ -79,16 +106,23 @@ def _product_source_ids(url):
     except Exception:return []
     out=[]
     patterns=[]
-    if "coupang.com" in host:
-        patterns=[("coupang",r"/vp/products/(\d+)"),("coupang",r"/products/(\d+)")]
-    elif "naver.com" in host:
-        patterns=[("naver_catalog",r"/catalog/(\d+)"),("naver_product",r"/products/(\d+)")]
-    elif "toss" in host or "sharelink" in host:
-        patterns=[("toss_product",r"/(?:products?|items?)/([A-Za-z0-9_-]{5,})")]
+    coupang=host=="coupang.com" or host.endswith(".coupang.com")
+    naver=host=="naver.com" or host.endswith(".naver.com")
+    toss=host=="toss.im" or host.endswith(".toss.im")
+    wala=host in {"wala-land.com","www.wala-land.com"}
+    if parsed.scheme not in {"http","https"} or parsed.username:return []
+    if coupang:
+        patterns=[("coupang",r"^/(?:vp/)?products/(\d+)(?:/|$)")]
+    elif naver:
+        patterns=[("naver_catalog",r"/catalog/(\d+)(?:/|$)"),("naver_product",r"/products/(\d+)(?:/|$)")]
+    elif toss:
+        patterns=[("toss_product",r"/(?:products?|items?)/([A-Za-z0-9_-]{5,})(?:/|$)")]
+    elif wala:
+        patterns=[("wala_content",r"^/(?:ko/|en/)?content/(\d+)(?:/|$)"),("wala_product",r"^/(?:ko/|en/)?products/(\d+)(?:/|$)")]
     for prefix,pattern in patterns:
         m=re.search(pattern,path,re.I)
         if m:out.append(prefix+":"+m.group(1).lower())
-    if host and any(x in host for x in ("coupang.com","naver.com","toss","sharelink")):
+    if coupang or naver or toss:
         try:query=parse_qs(parsed.query)
         except Exception:query={}
         for key in ("productId","product_id","catalogId","catalog_id","itemId","item_id","vendorItemId"):
@@ -171,8 +205,8 @@ def _empty_payload():
 
 def _read_payload():
     try:obj=json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
-    except Exception:return _empty_payload()
-    if not isinstance(obj,dict):return _empty_payload()
+    except FileNotFoundError:return _empty_payload()
+    if not isinstance(obj,dict):raise RuntimeError("상품 이력 형식이 잘못되었습니다. 원본을 보존한 상태로 복구가 필요합니다.")
     items=obj.get("items")
     if isinstance(items,list):
         items={str(x.get("key") or i):x for i,x in enumerate(items) if isinstance(x,dict)}
@@ -185,11 +219,10 @@ def _read_payload():
 
 def _write_payload(payload):
     REGISTRY_PATH.parent.mkdir(parents=True,exist_ok=True)
-    limit=max(1000,int(settings().get("published_product_registry_max_items",10000)))
     items=list((payload.get("items") or {}).items())
     items.sort(key=lambda kv:str((kv[1] or {}).get("last_saved_at") or ""),reverse=True)
-    payload["items"]=dict(items[:limit]);payload["updated_at"]=_now();payload["version"]=REGISTRY_VERSION
-    tokens=list(dict.fromkeys(str(x) for x in (payload.get("meta") or {}).get("import_tokens",[]) if x))[-20000:]
+    payload["items"]=dict(items);payload["updated_at"]=_now();payload["version"]=REGISTRY_VERSION
+    tokens=list(dict.fromkeys(str(x) for x in (payload.get("meta") or {}).get("import_tokens",[]) if x))
     payload.setdefault("meta",{})["import_tokens"]=tokens
     tmp=REGISTRY_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload,ensure_ascii=False,indent=2),encoding="utf-8")
@@ -203,26 +236,35 @@ def _record_profile(record):
             profile[key]=value
     return profile
 
-def _find_match(payload,profile):
+def _active_scope(blog_id: str | None = None) -> str:
+    from .blog_target import get_target_blog_id
+    return get_target_blog_id() if blog_id is None else blog_id
+
+
+def _find_match(payload,profile,blog_id=None):
+    scope=_active_scope(blog_id)
     threshold=float(settings().get("published_product_match_min_ratio",0.72))
     best=None
     for key,record in (payload.get("items") or {}).items():
+        if str(record.get("blog_id") or "")!=scope:continue
         ok,reason,score=_same_product_profiles(profile,_record_profile(record),threshold)
         if ok and (best is None or score>best[3]):best=(key,record,reason,score)
         if best and best[2] in ("source_product_id","exact_normalized_title"):break
     return best
 
-def _merge_record(payload,name,url="",mode="",saved_at="",evidence_token="",source="confirmed_save"):
+def _merge_record(payload,name,url="",mode="",saved_at="",evidence_token="",source="confirmed_save",blog_id=None):
+    scope=_active_scope(blog_id)
     profile=product_profile(name,url);canonical=profile.get("canonical") or ""
     if len(canonical)<3:return False,None
     tokens=payload.setdefault("meta",{}).setdefault("import_tokens",[])
-    if evidence_token and evidence_token in tokens:return False,None
-    match=_find_match(payload,profile)
+    scoped_token=scope+"|"+evidence_token if scope else evidence_token
+    match=_find_match(payload,profile,scope)
+    if evidence_token and scoped_token in tokens and match and source in (match[1].get("sources") or []):return False,match[0]
     if match:key,record=match[0],match[1]
     else:
-        seed=canonical+"|"+"|".join(profile.get("critical") or [])+"|"+str(len(payload.get("items") or {}))
+        seed=scope+"|"+canonical+"|"+"|".join(profile.get("critical") or [])+"|"+str(len(payload.get("items") or {}))
         key=hashlib.sha256(seed.encode("utf-8","ignore")).hexdigest()[:24]
-        record={"key":key,"name":profile["name"],"canonical":profile["canonical"],"base_canonical":profile["base_canonical"],
+        record={"key":key,"blog_id":scope,"name":profile["name"],"canonical":profile["canonical"],"base_canonical":profile["base_canonical"],
                 "terms":profile["terms"],"critical":profile["critical"],"models":profile["models"],"core_compact":profile["core_compact"],
                 "source_ids":[],"source_urls":[],"modes":[],"first_saved_at":saved_at or _now(),
                 "last_saved_at":saved_at or _now(),"save_count":0,"sources":[]}
@@ -233,7 +275,7 @@ def _merge_record(payload,name,url="",mode="",saved_at="",evidence_token="",sour
     record["sources"]=list(dict.fromkeys([*(record.get("sources") or []),str(source)]))
     record["last_saved_at"]=max(str(record.get("last_saved_at") or ""),str(saved_at or _now()))
     record["save_count"]=int(record.get("save_count") or 0)+1
-    if evidence_token:tokens.append(str(evidence_token))
+    if evidence_token:tokens.append(scoped_token)
     return True,key
 
 def _import_existing_successes(payload):
@@ -247,7 +289,7 @@ def _import_existing_successes(payload):
             if not isinstance(item,dict) or not item.get("name"):continue
             token="history:"+str(fingerprint)
             did,_=_merge_record(payload,item.get("name"),item.get("source_url") or "",
-                                item.get("mode") or "",item.get("saved_at") or "",token,"blog_history_import")
+                                item.get("mode") or "",item.get("saved_at") or "",token,"blog_history_import",str(item.get("blog_id") or ""))
             changed=changed or did
     try:
         con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
@@ -258,7 +300,7 @@ def _import_existing_successes(payload):
     for row in rows:
         token=f"db:{row['id']}:{row['updated_at'] or ''}:{row['status'] or ''}"
         did,_=_merge_record(payload,row["name"],row["source_url"] or "",row["status"] or "",
-                            row["updated_at"] or "",token,"studio_db_import")
+                            row["updated_at"] or "",token,"studio_db_import","")
         changed=changed or did
     return changed
 
@@ -269,17 +311,17 @@ def load_registry(import_existing=True):
         if changed:_write_payload(payload)
         return payload
 
-def record_published_product(row,mode,post_fingerprint="",saved_at=""):
+def record_published_product(row,mode,post_fingerprint="",saved_at="",blog_id=None):
     """Record one product only after Naver's draft-save verification succeeded."""
     with _LOCK:
         payload=_read_payload();import_changed=_import_existing_successes(payload)
         name=str(_value(row,"name","") or "");url=str(_value(row,"source_url","") or "")
         when=saved_at or _now();token="save:"+(str(post_fingerprint) or hashlib.sha256((name+"|"+when+"|"+str(mode)).encode("utf-8","ignore")).hexdigest())
-        changed,key=_merge_record(payload,name,url,str(mode or ""),when,token,"confirmed_naver_draft")
+        changed,key=_merge_record(payload,name,url,str(mode or ""),when,token,"confirmed_naver_draft",blog_id)
         if changed or import_changed:_write_payload(payload)
         return {"recorded":bool(changed),"key":key,"name":name,"saved_at":when}
 
-def record_known_published_product(name,url="",post_title="",post_url="",source="manual_existing_post",saved_at=""):
+def record_known_published_product(name,url="",post_title="",post_url="",source="manual_existing_post",saved_at="",blog_id=None):
     """Record a user-confirmed or safely matched existing Naver post.
 
     This is separate from confirmed draft-save recording.  It lets products
@@ -287,11 +329,14 @@ def record_known_published_product(name,url="",post_title="",post_url="",source=
     """
     with _LOCK:
         payload=_read_payload();import_changed=_import_existing_successes(payload)
+        scope=_active_scope(blog_id)
+        ignored=payload.setdefault("meta",{}).setdefault("ignored_post_matches",{})
+        ignored[scope]=[profile for profile in ignored.get(scope,[]) if not _same_product_profiles(product_profile(name,url),profile)[0]]
         when=saved_at or _now()
         evidence="known:"+hashlib.sha256(
             (str(source)+"|"+str(name)+"|"+str(post_title)+"|"+str(post_url)).encode("utf-8","ignore")
         ).hexdigest()
-        changed,key=_merge_record(payload,str(name or ""),str(url or ""),"already_published",when,evidence,str(source or "manual_existing_post"))
+        changed,key=_merge_record(payload,str(name or ""),str(url or ""),"already_published",when,evidence,str(source or "manual_existing_post"),blog_id)
         if key and key in (payload.get("items") or {}):
             record=payload["items"][key]
             if post_title:record["matched_post_titles"]=list(dict.fromkeys([*(record.get("matched_post_titles") or []),str(post_title)]))[:20]
@@ -299,12 +344,16 @@ def record_known_published_product(name,url="",post_title="",post_url="",source=
         if changed or import_changed:_write_payload(payload)
         return {"recorded":bool(changed),"key":key,"name":str(name or ""),"saved_at":when}
 
-def remove_known_published_product(name,url="",sources=None):
+def remove_known_published_product(name,url="",sources=None,blog_id=None):
     """Remove only manual/automatic-existing evidence, preserving real save history."""
     removable=set(sources or ("manual_existing_post","naver_rss_existing_post","title_file_existing_post"))
     with _LOCK:
-        payload=_read_payload();profile=product_profile(name,url);match=_find_match(payload,profile)
-        if not match:return {"removed":False,"kept":False}
+        payload=_read_payload();profile=product_profile(name,url);scope=_active_scope(blog_id);match=_find_match(payload,profile,scope)
+        ignored=payload.setdefault("meta",{}).setdefault("ignored_post_matches",{}).setdefault(scope,[])
+        if not any(_same_product_profiles(profile,previous)[0] for previous in ignored):ignored.append(profile)
+        if not match:
+            _write_payload(payload)
+            return {"removed":False,"kept":False}
         key,record=match[0],match[1]
         old_sources=list(record.get("sources") or [])
         record["sources"]=[value for value in old_sources if value not in removable]
@@ -316,12 +365,14 @@ def remove_known_published_product(name,url="",sources=None):
         payload.get("items",{}).pop(key,None);_write_payload(payload)
         return {"removed":True,"kept":False,"key":key}
 
-def filter_published_candidates(rows):
+def filter_published_candidates(rows,blog_id=None):
     """Split discovery rows into fresh candidates and already-drafted products."""
     if not bool(settings().get("collection_skip_published_products",True)):
         return list(rows),[]
-    payload=load_registry(import_existing=True);items=payload.get("items") or {}
-    if not items:return list(rows),[]
+    scope=_active_scope(blog_id)
+    if not scope:return list(rows),[]
+    payload=load_registry(import_existing=True)
+    items={key:record for key,record in (payload.get("items") or {}).items() if str(record.get("blog_id") or "")==scope}
     kept=[];excluded=[];threshold=float(settings().get("published_product_match_min_ratio",0.72))
     exact_names={str(r.get("canonical") or ""): (k,r) for k,r in items.items() if r.get("canonical")}
     source_index={sid:(k,r) for k,r in items.items() for sid in (r.get("source_ids") or [])}
@@ -338,6 +389,7 @@ def filter_published_candidates(rows):
             for k,r,rprofile in profiles:
                 ok,reason,score=_same_product_profiles(profile,rprofile,threshold)
                 if ok and (hit is None or score>hit[3]):hit=(k,r,reason,score)
+        if hit is None:hit=_find_post_title_match(payload,profile,scope)
         if hit is None:kept.append(row);continue
         record=hit[1]
         excluded.append({
@@ -345,10 +397,59 @@ def filter_published_candidates(rows):
             "name":_value(row,"name",""),"url":_value(row,"url",""),
             "matched_name":record.get("name") or "","saved_at":record.get("last_saved_at") or "",
             "match_reason":hit[2],"match_score":round(float(hit[3]),4),"registry_key":hit[0],
+            "blog_id":scope,"evidence_sources":list(record.get("sources") or []),
         })
     return kept,excluded
 
 def registry_summary():
     payload=load_registry(import_existing=True)
-    return {"products":len(payload.get("items") or {}),"updated_at":payload.get("updated_at") or "",
+    scope=_active_scope()
+    entries=[record for record in (payload.get("items") or {}).values() if scope and str(record.get("blog_id") or "")==scope]
+    drafts=sum(bool(set(record.get("sources") or []).intersection({"confirmed_naver_draft","blog_history_import","studio_db_import"})) for record in entries)
+    published=sum(bool(set(record.get("sources") or []).intersection({"manual_existing_post","naver_rss_existing_post","title_file_existing_post"})) for record in entries)
+    return {"products":len(entries),"drafts":drafts,"published":published,"blog_id":scope,
+            "source_posts":len((payload.get("meta",{}).get("source_posts") or {}).get(scope,[])),
+            "legacy_products":sum(not record.get("blog_id") for record in (payload.get("items") or {}).values()),"updated_at":payload.get("updated_at") or "",
             "path":str(REGISTRY_PATH)}
+
+
+def registry_entries(include_legacy: bool = False) -> list[RegistryRecord]:
+    """List evidence without assigning historical unknown accounts to the current blog."""
+    payload=load_registry(import_existing=True);scope=_active_scope()
+    return [record for record in (payload.get("items") or {}).values()
+            if (scope and str(record.get("blog_id") or "")==scope) or (include_legacy and not record.get("blog_id"))]
+
+
+def find_published_match(name: str,url: str = "",blog_id: str | None = None) -> RegistryRecord | None:
+    """Find active-blog evidence for a save guard regardless of collection preferences."""
+    scope=_active_scope(blog_id)
+    if not scope:return None
+    payload=load_registry();profile=product_profile(name,url)
+    match=_find_match(payload,profile,scope) or _find_post_title_match(payload,profile,scope)
+    return match[1] if match else None
+
+
+def store_source_posts(posts: Sequence[SourcePost],blog_id: str) -> None:
+    with _LOCK:
+        payload=_read_payload()
+        source_posts=payload.setdefault("meta",{}).setdefault("source_posts",{})
+        merged={(post.get("title"),post.get("url")):post for post in source_posts.get(blog_id,[])}
+        for post in posts:merged[(post.get("title"),post.get("url"))]=post
+        source_posts[blog_id]=list(merged.values())
+        _write_payload(payload)
+
+
+def _find_post_title_match(payload,profile,scope: str) -> tuple[str,RegistryRecord,str,float] | None:
+    from .already_posted_adapter import AUTO_SCORE,_match_title
+    meta=payload.get("meta") or {}
+    ignored=(meta.get("ignored_post_matches") or {}).get(scope,[])
+    if any(_same_product_profiles(profile,previous)[0] for previous in ignored):return None
+    for post in (meta.get("source_posts") or {}).get(scope,[]):
+        score,reason=_match_title({"name":profile["name"],"source_url":""},post.get("title") or "")
+        if score<AUTO_SCORE:continue
+        key="post:"+hashlib.sha256((scope+"|"+str(post.get("title"))+"|"+str(post.get("url"))).encode("utf-8")).hexdigest()[:24]
+        source="naver_rss_existing_post" if post.get("source")=="NAVER_RSS" else "title_file_existing_post"
+        record: RegistryRecord={"key":key,"name":profile["name"],"blog_id":scope,"sources":[source],
+                "last_saved_at":post.get("published_at") or "","matched_post_titles":[post.get("title") or ""],"matched_post_urls":[post.get("url") or ""]}
+        return key,record,reason,float(score)
+    return None

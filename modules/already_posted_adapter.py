@@ -17,15 +17,21 @@ import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from contextlib import closing
 from pathlib import Path
 
-from .common import DATA, DB, OUTPUTS, init_db, log
+from .common import DATA, DB, OUTPUTS, init_db
 from .published_product_registry import (
+    _find_match,
+    _find_post_title_match,
     _same_product_profiles,
+    load_registry,
     product_profile,
     record_known_published_product,
     remove_known_published_product,
+    store_source_posts,
 )
+from .posted_blog_scope import switch_scope
 
 
 CONFIG_PATH=DATA/"already_posted_config.json"
@@ -60,8 +66,34 @@ def ensure_schema(con=None):
     for name,kind in POSTED_COLUMNS:
         if name not in columns:con.execute(f"ALTER TABLE products ADD COLUMN {name} {kind}")
     con.execute("CREATE INDEX IF NOT EXISTS ix_products_already_posted ON products(already_posted,already_posted_review,import_batch_id)")
+    activate_blog_scope(con)
     con.commit()
     if own:con.close()
+
+
+def activate_blog_scope(con: sqlite3.Connection | None = None) -> str:
+    from .blog_target import get_target_blog_id
+    scope=get_target_blog_id()
+    if con is None:
+        init_db()
+        with closing(sqlite3.connect(DB)) as owned,owned:
+            return activate_blog_scope(owned)
+    switch_scope(con,scope)
+    if not scope:return scope
+    payload=load_registry()
+    rows=con.execute("SELECT id,name,source_url,already_posted,already_posted_auto_ignored FROM products").fetchall()
+    for row in rows:
+        if row[3]:continue
+        profile=product_profile(row[1],row[2])
+        match=_find_match(payload,profile,scope) or _find_post_title_match(payload,profile,scope)
+        if not match:continue
+        record=match[1]
+        durable=bool(set(record.get("sources") or []).intersection({"confirmed_naver_draft","blog_history_import","studio_db_import"}))
+        if row[4] and not durable:continue
+        method="REGISTRY_DRAFT" if durable else "REGISTRY_PUBLISHED"
+        con.execute("UPDATE products SET already_posted=1,already_posted_review=0,already_posted_method=?,already_posted_at=? WHERE id=?",
+                    (method,record.get("last_saved_at") or "",row[0]))
+    return scope
 
 
 def _atomic_json(path,value):
@@ -72,19 +104,8 @@ def _atomic_json(path,value):
 
 
 def normalize_blog_id(value):
-    raw=str(value or "").strip()
-    looks_like_url="://" in raw or raw.casefold().startswith(("blog.naver.com/","m.blog.naver.com/"))
-    if looks_like_url:
-        parsed=urllib.parse.urlparse(raw if "://" in raw else "https://"+raw)
-        query=urllib.parse.parse_qs(parsed.query)
-        raw=str((query.get("blogId") or query.get("blogid") or [""])[0]).strip()
-        if not raw:
-            parts=[part for part in parsed.path.split("/") if part]
-            raw=parts[0] if parts else ""
-    raw=raw.strip().strip("/@")
-    if not re.fullmatch(r"[A-Za-z0-9_.-]{3,64}",raw):
-        raise RuntimeError("네이버 블로그 ID 또는 blog.naver.com 주소를 정확히 입력하세요.")
-    return raw
+    from .blog_target import normalize_blog_id as normalize_target
+    return normalize_target(value)
 
 
 def load_config():
@@ -96,6 +117,8 @@ def load_config():
 
 def save_blog_id(value):
     blog_id=normalize_blog_id(value)
+    from .blog_target import require_target_blog_id
+    if blog_id!=require_target_blog_id():raise RuntimeError("RSS 블로그와 현재 작성 대상이 다릅니다. 먼저 작성 대상 블로그를 변경하세요.")
     cfg=load_config();cfg.update({"blog_id":blog_id,"updated_at":_now()})
     _atomic_json(CONFIG_PATH,cfg)
     return blog_id
@@ -131,7 +154,7 @@ def fetch_naver_rss(blog_id,timeout=25):
         published=str(item.findtext("pubDate") or "").strip()
         key=(title.casefold(),link)
         if not title or key in seen:continue
-        seen.add(key);posts.append({"title":title,"url":link,"published_at":published,"source":"NAVER_RSS"})
+        seen.add(key);posts.append({"title":title,"url":link,"published_at":published,"source":"NAVER_RSS","blog_id":blog_id})
     if not posts:raise RuntimeError("RSS에서 공개 게시글 제목을 찾지 못했습니다. 블로그 ID·공개 설정을 확인하세요.")
     return posts,{"blog_id":blog_id,"rss_url":url,"count":len(posts),"checked_at":_now()}
 
@@ -237,6 +260,14 @@ def _rows_for_batch(con,batch_id=""):
 
 
 def match_posts(posts,batch_id="",method="NAVER_RSS_AUTO",progress=None):
+    from .blog_target import require_target_blog_id
+    scope=require_target_blog_id()
+    for post in posts:
+        source_scope=str(post.get("blog_id") or "")
+        post_url=str(post.get("url") or "")
+        if method=="NAVER_RSS_AUTO" and not source_scope and post_url:source_scope=normalize_blog_id(post_url)
+        if method=="NAVER_RSS_AUTO" and not source_scope:raise RuntimeError("RSS 게시글의 블로그 출처를 확인할 수 없습니다.")
+        if source_scope and source_scope!=scope:raise RuntimeError("현재 작성 대상과 다른 블로그의 게시글은 대조할 수 없습니다.")
     ensure_schema();con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
     rows=_rows_for_batch(con,batch_id);auto=0;review=0;unchanged=0;matches=[]
     try:
@@ -255,8 +286,7 @@ def match_posts(posts,batch_id="",method="NAVER_RSS_AUTO",progress=None):
                     (method,post.get("title") or "",post.get("url") or "",_now(),float(score),row["id"]),
                 );auto+=1
                 source="naver_rss_existing_post" if method=="NAVER_RSS_AUTO" else "title_file_existing_post"
-                try:record_known_published_product(row["name"],row["source_url"] or "",post.get("title") or "",post.get("url") or "",source)
-                except Exception as exc:log("기존 게시글 레지스트리 기록 경고: "+str(exc))
+                record_known_published_product(row["name"],row["source_url"] or "",post.get("title") or "",post.get("url") or "",source,blog_id=scope)
                 matches.append({"product_id":row["id"],"product_no":row["product_no"],"name":row["name"],"decision":"POSTED","score":round(score,4),"reason":reason,"post_title":post.get("title") or "","post_url":post.get("url") or ""})
             elif post is not None and score>=REVIEW_SCORE:
                 con.execute(
@@ -268,11 +298,14 @@ def match_posts(posts,batch_id="",method="NAVER_RSS_AUTO",progress=None):
             if progress:progress(index,len(rows),f"기존 게시글 대조 {index}/{len(rows)}: {row['name'][:30]}")
         con.commit()
     finally:con.close()
+    store_source_posts(posts,scope)
     report=export_status_report(batch_id,matches)
-    return {"processed":len(rows),"posted":auto,"review":review,"unchanged":unchanged,"report_csv":report,"message":f"기존 게시글 자동대조 완료 · 게시완료 {auto}개 · 확인 필요 {review}개 · 남은 제품 {batch_summary(batch_id)['remaining']}개"}
+    return {"processed":len(rows),"posted":auto,"review":review,"unchanged":unchanged,"report_csv":report,"blog_id":scope,"message":f"[{scope}] 기존 게시글 자동대조 완료 · 게시완료 {auto}개 · 확인 필요 {review}개 · 남은 제품 {batch_summary(batch_id)['remaining']}개"}
 
 
 def mark_manual(product_ids,posted=True):
+    from .blog_target import require_target_blog_id
+    scope=require_target_blog_id()
     ids=[int(value) for value in product_ids if str(value).isdigit()]
     if not ids:return {"changed":0,"message":"선택한 제품이 없습니다."}
     ensure_schema();con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
@@ -284,19 +317,18 @@ def mark_manual(product_ids,posted=True):
                     "UPDATE products SET already_posted=1,already_posted_review=0,already_posted_auto_ignored=0,already_posted_method='MANUAL',already_posted_title=COALESCE(NULLIF(title,''),name),already_posted_url='',already_posted_at=?,already_posted_match_score=1.0,updated_at=datetime('now','localtime') WHERE id=?",
                     (_now(),row["id"]),
                 )
-                try:record_known_published_product(row["name"],row["source_url"] or "",row["title"] or row["name"],"","manual_existing_post")
-                except Exception as exc:log("수동 게시완료 레지스트리 기록 경고: "+str(exc))
+                record_known_published_product(row["name"],row["source_url"] or "",row["title"] or row["name"],"","manual_existing_post",blog_id=scope)
             else:
                 con.execute(
                     "UPDATE products SET already_posted=0,already_posted_review=0,already_posted_auto_ignored=1,already_posted_method='MANUAL_NOT_POSTED',already_posted_title=NULL,already_posted_url=NULL,already_posted_at=?,already_posted_match_score=NULL,updated_at=datetime('now','localtime') WHERE id=?",
                     (_now(),row["id"]),
                 )
-                try:remove_known_published_product(row["name"],row["source_url"] or "")
-                except Exception as exc:log("게시표시 해제 레지스트리 정리 경고: "+str(exc))
+                remove_known_published_product(row["name"],row["source_url"] or "",blog_id=scope)
             changed+=1
         con.commit()
     finally:con.close()
-    return {"changed":changed,"message":f"선택 제품 {changed}개를 {'기존 게시완료' if posted else '미게시(수동 확인)'}로 표시했습니다."}
+    activate_blog_scope()
+    return {"changed":changed,"blog_id":scope,"message":f"[{scope}] 선택 제품 {changed}개의 {'기존 게시완료 표시' if posted else '수동·대조 표시 해제'}를 반영했습니다. 확인된 임시저장 이력은 유지됩니다."}
 
 
 def batch_summary(batch_id=""):
@@ -304,12 +336,12 @@ def batch_summary(batch_id=""):
     try:
         where="COALESCE(status,'') NOT LIKE '추천제외:%'";params=[]
         if batch_id:where+=" AND COALESCE(import_batch_id,'')=?";params.append(batch_id)
-        total,posted,review,manual_not=con.execute(
-            f"SELECT COUNT(*),SUM(CASE WHEN COALESCE(already_posted,0)=1 THEN 1 ELSE 0 END),SUM(CASE WHEN COALESCE(already_posted_review,0)=1 AND COALESCE(already_posted,0)=0 THEN 1 ELSE 0 END),SUM(CASE WHEN COALESCE(already_posted_auto_ignored,0)=1 THEN 1 ELSE 0 END) FROM products WHERE {where}",params
+        total,posted,review,manual_not,drafts=con.execute(
+            f"SELECT COUNT(*),SUM(CASE WHEN COALESCE(already_posted,0)=1 THEN 1 ELSE 0 END),SUM(CASE WHEN COALESCE(already_posted_review,0)=1 AND COALESCE(already_posted,0)=0 THEN 1 ELSE 0 END),SUM(CASE WHEN COALESCE(already_posted_auto_ignored,0)=1 THEN 1 ELSE 0 END),SUM(CASE WHEN already_posted=1 AND already_posted_method='REGISTRY_DRAFT' THEN 1 ELSE 0 END) FROM products WHERE {where}",params
         ).fetchone()
     finally:con.close()
     total=int(total or 0);posted=int(posted or 0);review=int(review or 0);manual_not=int(manual_not or 0)
-    return {"total":total,"posted":posted,"review":review,"manual_not_posted":manual_not,"remaining":max(0,total-posted)}
+    return {"total":total,"posted":posted,"drafts":int(drafts or 0),"published":posted-int(drafts or 0),"review":review,"manual_not_posted":manual_not,"remaining":max(0,total-posted)}
 
 
 def pending_product_ids(batch_id="",image_state=""):
@@ -327,11 +359,13 @@ def export_status_report(batch_id="",matches=None):
     con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
     rows=_rows_for_batch(con,batch_id);con.close()
     suffix=re.sub(r"[^0-9A-Za-z_-]+","_",batch_id or "ALL")[:40]
-    path=REPORT_ROOT/f"already_posted_{suffix}.csv"
+    from .blog_target import get_target_blog_id
+    scope=get_target_blog_id()
+    path=REPORT_ROOT/f"already_posted_{scope or 'unassigned'}_{suffix}.csv"
     with path.open("w",encoding="utf-8-sig",newline="") as stream:
         writer=csv.writer(stream);writer.writerow(["상품번호","상품명","게시구분","판정방식","대조 게시글 제목","게시글 URL","일치점수","이미지상태","현재처리상태"])
         for row in rows:
-            if int(row["already_posted"] or 0):state="기존 게시완료"
+            if int(row["already_posted"] or 0):state="확인된 임시저장 이력" if row["already_posted_method"]=="REGISTRY_DRAFT" else "기존 게시완료"
             elif int(row["already_posted_review"] or 0):state="자동대조 확인필요"
             elif int(row["already_posted_auto_ignored"] or 0):state="미게시 수동확인"
             else:state="남은 제품"
