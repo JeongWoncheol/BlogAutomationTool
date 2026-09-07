@@ -38,7 +38,7 @@
   "image_count": 3,
   "tags_count": 30,
   "draft_only": true,
-  "chrome_profile": "",
+  "chrome_profile": "NaverBlogAutomationProfile",
   "llm_provider": "ollama",
   "ollama_model": "qwen3:8b",
   "openai_model": "gpt-5.6-sol",
@@ -854,6 +854,7 @@
   "image_strict_product_zone_required": true,
   "image_revalidate_legacy_v8_08_42_evidence": true,
   "celebrity_style_enabled": true,
+  "celebrity_style_source": "wala",
   "celebrity_style_period_days": 3,
   "celebrity_style_queries": [
     "연예인 공항패션",

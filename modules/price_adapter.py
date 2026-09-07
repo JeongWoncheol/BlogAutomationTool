@@ -13,6 +13,7 @@ from . import chrome_collector
 from . import coupang_partners_api
 from . import toss_sharelink_api
 from . import naver_shopping_api
+from .wala_policy import SOURCE_REASON, is_wala_product, skipped_price
 
 def _image_dhash(path):
     im=Image.open(path).convert("L").resize((9,8),Image.Resampling.LANCZOS)
@@ -660,6 +661,11 @@ def _run_selenium(context=None,progress=None):
     init_db_fast()
     con=db_connect(row_factory=True)
     rows=con.execute("SELECT * FROM products WHERE status NOT LIKE '추천제외:%' AND COALESCE(already_posted,0)=0 ORDER BY product_no,id").fetchall()
+    skipped=[skipped_price(int(r["id"])) for r in rows if is_wala_product(r)]
+    rows=[r for r in rows if not is_wala_product(r)]
+    if not rows:
+        con.close()
+        return {"processed":0,"skipped":skipped,"stage_ok":True,"soft_pending":False,"message":SOURCE_REASON}
     drivers={}
     prog=ProgressThrottle(progress)
     try:
@@ -722,6 +728,8 @@ def _run_selenium(context=None,progress=None):
             try:d.quit()
             except:pass
         con.close()
+    return {"processed":len(rows),"skipped":skipped,"stage_ok":True,"soft_pending":False,
+            "message":f"3사 가격 처리 {len(rows)}건 · 왈라랜드 제외 {len(skipped)}건"}
 
 
 def _export_price_summary(con):
@@ -801,6 +809,7 @@ def verify_product(product_id,progress=None):
     try:
         r=con.execute("SELECT * FROM products WHERE id=?",(int(product_id),)).fetchone()
         if not r:raise RuntimeError("선택 상품을 찾지 못했습니다.")
+        if is_wala_product(r):return skipped_price(int(r["id"]))
         records_by={}
         for site in ["네이버쇼핑","쿠팡","토스쇼핑"]:
             got,_=_collect_site_with_fallback([r],site,cfg,None,progress,prefix="one",con=con)
@@ -847,6 +856,7 @@ def verify_product_live_browser(product_id,progress=None):
     try:
         r=con.execute("SELECT * FROM products WHERE id=?",(int(product_id),)).fetchone()
         if not r:raise RuntimeError("선택 상품을 찾지 못했습니다.")
+        if is_wala_product(r):return skipped_price(int(r["id"]))
         records_by={}
         # Coupang will still use API first if configured; only a miss can reach browser.
         for site in ["쿠팡","네이버쇼핑","토스쇼핑"]:
@@ -869,6 +879,12 @@ def run(context=None,progress=None):
         return _run_selenium(context,progress)
     init_db_fast();con=db_connect(row_factory=True)
     rows=con.execute("SELECT * FROM products WHERE COALESCE(already_posted,0)=0 ORDER BY product_no,id").fetchall()
+    skipped=[skipped_price(int(r["id"])) for r in rows if is_wala_product(r)]
+    rows=[r for r in rows if not is_wala_product(r)]
+    if not rows:
+        con.close()
+        return {"processed":0,"skipped":skipped,"price_complete":0,"price_incomplete":[],
+                "search_order":[],"fallback_queries":0,"stage_ok":True,"soft_pending":False,"message":SOURCE_REASON}
     site_order=["네이버쇼핑","쿠팡","토스쇼핑"]
     grouped={r["id"]:{} for r in rows};fallback_total=0
 
@@ -948,7 +964,7 @@ def run(context=None,progress=None):
                                 "API진단":json.dumps(rec.get("api_diagnostic") or {},ensure_ascii=False),
                                 "매칭상세":json.dumps(rec.get("match_detail") or {},ensure_ascii=False)})
     except Exception as e:log("가격 진단 CSV 저장 실패: "+str(e))
-    return {"processed":len(rows),"android_toss":android_state,"search_order":site_order,"fallback_queries":fallback_total,
+    return {"processed":len(rows),"skipped":skipped,"android_toss":android_state,"search_order":site_order,"fallback_queries":fallback_total,
             "price_complete":len(rows)-len(incomplete),"price_incomplete":incomplete,"image_repair":repair,
             "stage_ok":stage_ok,"soft_pending":True if incomplete else False,
             "message":("가격+동일상품 이미지 3사 검증 완료" if not incomplete else f"3사 조회 완료 · 3사 모두 동일상품 확인 {len(rows)-len(incomplete)}/{len(rows)} · 미판매/미확인 {len(incomplete)}건은 비교표에 그대로 표시")}

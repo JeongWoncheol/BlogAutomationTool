@@ -2,3 +2,5 @@ selenium>=4.28.0
 Pillow>=10.0.0
 
 Appium-Python-Client>=4.4.0
+httpx2[http2,brotli,zstd]>=2.12,<3
+pydantic>=2,<3

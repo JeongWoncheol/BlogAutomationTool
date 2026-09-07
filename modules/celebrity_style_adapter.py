@@ -190,6 +190,10 @@ def init_schema():
 
 
 def health():
+    if _wala_enabled():
+        from .wala_store import archive_counts
+        counts=archive_counts()
+        return {"ready":True,"name":"왈라랜드 착장","message":f"공개 원문 수집 · API 키 불필요 · 저장 {counts['cached']}/{counts['total']}건"}
     init_schema();cid,sec=_naver_creds();cfg=settings()
     text=ollama_local.status(cfg)
     return {"ready":bool(cid and sec) or bool(cfg.get("celebrity_style_google_fallback",True)),
@@ -293,7 +297,17 @@ def _candidate_score(name,event,sources,days):
     return round(score,1),len(hosts),round(freshness,1)
 
 
-def collect_latest(days=None,celebrity="",progress=None):
+def _wala_enabled() -> bool:
+    return settings().get("celebrity_style_source", "wala") == "wala"
+
+
+def collect_latest(days=None,celebrity="",progress=None,stop_check=None,max_articles=50):
+    if _wala_enabled():
+        from . import wala_sync
+        init_schema()
+        result=wala_sync.collect_latest(days=int(days or 0),celebrity=celebrity,progress=progress,stop_check=stop_check,max_articles=max_articles)
+        _write_candidates_csv()
+        return result
     init_schema();cfg=settings();days=max(1,min(30,int(days or cfg.get("celebrity_style_period_days",3))))
     manual=_clean(celebrity);queries=[]
     if manual:
@@ -442,6 +456,9 @@ def _google_image_sources(query,limit=12):
 
 
 def _collect_outfit_reference_images(row,sources):
+    if str(row["fingerprint"]).startswith("wala:"):
+        from .wala_images import reference_images
+        return reference_images(row,sources)
     cfg=settings();state={"queries":[],"candidates":[],"downloaded":[],"errors":[]}
     celeb=str(row.get("celebrity_name") or "").strip();look=str(row.get("look_type") or "패션화제").strip();eday=str(row.get("event_date") or "").strip()
     if not celeb:return state
@@ -544,13 +561,16 @@ JSON 객체: {{"items":[{{"category":"아우터/상의/하의/원피스/가방/�
     return state
 
 
-def collect_reference_images(candidate_ids=None,progress=None):
+def collect_reference_images(candidate_ids=None,progress=None,stop_check=None):
     """Explicitly collect only outfit-related reference images for selected candidates.
 
     Files are evidence/analysis references; they are not automatically promoted
     to blog image slots.  This prevents news/photo copyright material from being
     silently republished while still letting the outfit verifier use the images.
     """
+    if _wala_enabled():
+        from . import wala_processing
+        return wala_processing.collect_reference_images(candidate_ids,progress,stop_check)
     init_schema();con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
     where="WHERE 1=1";params=[]
     ids=[int(x) for x in (candidate_ids or []) if str(x).isdigit()]
@@ -615,7 +635,10 @@ def _item_confidence(item,sources):
     return min(100,score),exact,len(hosts)
 
 
-def analyze_unfinished(candidate_ids=None,progress=None):
+def analyze_unfinished(candidate_ids=None,progress=None,stop_check=None):
+    if _wala_enabled():
+        from . import wala_processing
+        return wala_processing.analyze_unfinished(candidate_ids,progress,stop_check)
     init_schema();con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
     where="WHERE status NOT IN ('원고완료','작성물연동')";params=[]
     ids=[int(x) for x in (candidate_ids or []) if str(x).isdigit()]
@@ -683,7 +706,10 @@ def _best_similar_coupang(query):
     return best
 
 
-def match_products(candidate_ids=None,progress=None):
+def match_products(candidate_ids=None,progress=None,stop_check=None):
+    if _wala_enabled():
+        from . import wala_processing
+        return wala_processing.match_products(candidate_ids,progress,stop_check)
     init_schema();con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
     where="WHERE c.status IN ('착장분석완료','상품매칭부분','착장근거부족')";params=[]
     ids=[int(x) for x in (candidate_ids or []) if str(x).isdigit()]
@@ -786,7 +812,10 @@ def _draft_to_blocks(obj,sources):
     return blocks
 
 
-def generate_drafts(candidate_ids=None,progress=None):
+def generate_drafts(candidate_ids=None,progress=None,stop_check=None):
+    if _wala_enabled():
+        from . import wala_drafts
+        return wala_drafts.generate_drafts(candidate_ids,progress,stop_check)
     init_schema();cfg=settings();con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
     where="WHERE status IN ('착장분석완료','상품매칭완료','상품매칭부분','착장근거부족')";params=[]
     ids=[int(x) for x in (candidate_ids or []) if str(x).isdigit()]
@@ -849,19 +878,30 @@ def promote_candidate(candidate_id):
     # Prefer a verified/selected Coupang result for affiliate conversion. Similar-style matches remain clearly labelled in article text.
     try:
         cp=_safe_json(item["coupang_product_json"],{})
-        if cp and str(cp.get("url") or "").strip():
+        if not str(row["fingerprint"]).startswith("wala:") and cp and str(cp.get("url") or "").strip():
             dl=coupang_partners_api.create_deeplink(str(cp.get("url") or ""),product_id=str(cp.get("product_id") or ""),product_name=str(cp.get("name") or item["matched_name"]))
             if dl.get("ok"):
                 con.execute("UPDATE products SET sharelink=? WHERE id=?",(str(dl.get("sharelink") or dl.get("shorten_url") or ""),pid))
     except Exception as exc:log("연예인 착장 Sharelink 생성 보류: "+str(exc))
+    if str(row["fingerprint"]).startswith("wala:"):
+        con.execute("UPDATE products SET source_platform='왈라랜드',sharelink='' WHERE id=?",(pid,))
     con.execute("UPDATE celebrity_style_candidates SET promoted_product_id=?,status='작성물연동',updated_at=? WHERE id=?",(pid,_now(),row["id"]))
     con.execute("UPDATE celebrity_style_items SET matched_product_id=? WHERE id=?",(pid,item["id"]));con.commit();con.close()
     return {"product_id":pid,"candidate_id":row["id"],"matched_name":item["matched_name"],"match_type":item["match_type"],"message":f"기존 작성 파이프라인에 연동 완료 · 상품ID {pid}"}
 
 
-def candidate_rows(limit=300):
+def candidate_total() -> int:
+    from contextlib import closing
+    init_schema()
+    where=" WHERE fingerprint LIKE 'wala:%'" if _wala_enabled() else ""
+    with closing(sqlite3.connect(DB)) as con:
+        return int(con.execute("SELECT COUNT(*) FROM celebrity_style_candidates"+where).fetchone()[0])
+
+
+def candidate_rows(limit=300,offset=0):
     init_schema();con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
-    rows=con.execute("SELECT * FROM celebrity_style_candidates ORDER BY event_date DESC,confidence_score DESC,updated_at DESC LIMIT ?",(int(limit),)).fetchall();out=[]
+    where=" WHERE fingerprint LIKE 'wala:%'" if _wala_enabled() else ""
+    rows=con.execute("SELECT * FROM celebrity_style_candidates"+where+" ORDER BY event_date DESC,confidence_score DESC,id DESC LIMIT ? OFFSET ?",(int(limit),max(0,int(offset)))).fetchall();out=[]
     for r in rows:
         d=dict(r);items=con.execute("SELECT * FROM celebrity_style_items WHERE candidate_id=? ORDER BY confidence_score DESC,id",(r["id"],)).fetchall()
         d["items"]=[dict(x) for x in items];d["item_count"]=len(items);d["matched_count"]=sum(1 for x in items if x["matched_name"])
@@ -878,7 +918,7 @@ def candidate_detail(candidate_id):
 
 
 def _write_candidates_csv():
-    OUTPUTS.mkdir(parents=True,exist_ok=True);p=OUTPUTS/"celebrity_style_candidates.csv";rows=candidate_rows(500)
+    OUTPUTS.mkdir(parents=True,exist_ok=True);p=OUTPUTS/"celebrity_style_candidates.csv";rows=candidate_rows(-1)
     fields=["id","celebrity_name","event_date","look_type","source_count","independent_source_count","confidence_score","confidence_label","item_count","matched_count","status","draft_title","promoted_product_id"]
     with p.open("w",encoding="utf-8-sig",newline="") as f:
         w=csv.DictWriter(f,fieldnames=fields);w.writeheader()
@@ -888,7 +928,8 @@ def _write_candidates_csv():
 
 def _write_items_csv():
     OUTPUTS.mkdir(parents=True,exist_ok=True);p=OUTPUTS/"celebrity_style_items.csv";con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
-    rows=con.execute("SELECT c.celebrity_name,c.event_date,c.look_type,i.* FROM celebrity_style_items i JOIN celebrity_style_candidates c ON c.id=i.candidate_id ORDER BY c.event_date DESC,c.id,i.confidence_score DESC").fetchall();con.close()
+    where=" WHERE c.fingerprint LIKE 'wala:%'" if _wala_enabled() else ""
+    rows=con.execute("SELECT c.celebrity_name,c.event_date,c.look_type,i.* FROM celebrity_style_items i JOIN celebrity_style_candidates c ON c.id=i.candidate_id"+where+" ORDER BY c.event_date DESC,c.id,i.confidence_score DESC").fetchall();con.close()
     fields=["candidate_id","celebrity_name","event_date","look_type","item_category","item_description","brand","model_name","color","evidence_level","confidence_score","exact_claim_allowed","matched_name","matched_price","match_type","matched_url"]
     with p.open("w",encoding="utf-8-sig",newline="") as f:
         w=csv.DictWriter(f,fieldnames=fields);w.writeheader()
@@ -897,20 +938,34 @@ def _write_items_csv():
 
 
 def export_paths():
-    return {"candidates":str(_write_candidates_csv()),"items":str(_write_items_csv())}
+    paths={"candidates":str(_write_candidates_csv()),"items":str(_write_items_csv())}
+    if _wala_enabled():
+        from .wala_store import export_archive,init_schema as init_archive
+        init_archive()
+        paths["archive"]=str(export_archive(OUTPUTS/"wala_archive.jsonl"))
+    return paths
 
 
-def run_full(days=None,celebrity="",progress=None):
+def run_full(days=None,celebrity="",progress=None,stop_check=None,max_articles=50):
     phases=[("최신 착장 수집",collect_latest),("착장 근거 분석",analyze_unfinished),("상품 검증/매칭",match_products),("블로그 원고 생성",generate_drafts)]
     results={};batch_ids=[]
     for pi,(name,fn) in enumerate(phases):
+        if stop_check and stop_check():
+            return {"stage_ok":False,"results":results,"message":"착장 파이프라인 중지 · 저장된 원문부터 다시 진행할 수 있습니다."}
         def cb(d,t,m,pi=pi,name=name):
             if progress:progress(pi*100+(d/max(1,t))*100,len(phases)*100,f"{name} · {m}")
         if fn is collect_latest:
-            r=fn(days=days,celebrity=celebrity,progress=cb);batch_ids=list(r.get("candidate_ids") or [])
-        else:r=fn(candidate_ids=batch_ids or None,progress=cb)
+            r=fn(days=days,celebrity=celebrity,progress=cb,stop_check=stop_check,max_articles=max_articles);batch_ids=list(r.get("candidate_ids") or [])
+            if r.get("stopped") or not batch_ids:
+                results[name]=r
+                return {"stage_ok":not r.get("stopped"),"results":results,"message":r.get("message") or "검색 일치 없음"}
+        else:r=fn(candidate_ids=batch_ids,progress=cb,stop_check=stop_check)
         results[name]=r
+        if r.get("stopped"):
+            return {"stage_ok":False,"results":results,"message":r.get("message") or "중지됨"}
     if progress:progress(100,100,"연예인 착장 전체 파이프라인 완료")
-    return {"stage_ok":True,"results":results,"message":"연예인 착장 수집 → 검증 → 상품매칭 → 원고생성 완료"}
+    message="연예인 착장 수집 → 검증 → 상품매칭 → 원고생성 완료"
+    if _wala_enabled():message+=" · "+str(results["최신 착장 수집"].get("message") or "")
+    return {"stage_ok":True,"results":results,"message":message}
 
 init_schema()
