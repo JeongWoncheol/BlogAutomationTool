@@ -7,9 +7,11 @@ product cards, so results are stored in ``trend_candidates`` and can be reviewed
 or exported without changing the existing Top100 product pipeline.
 """
 from pathlib import Path
+from collections.abc import Callable
 import csv, json, re, sqlite3, time
 from .common import ROOT, DB, settings, log
 from . import chrome_collector
+from .collection_preferences import CollectionPreferences, load_preferences, apply_preferences, AGE_GROUPS
 
 DEFAULT_CATEGORIES=["패션의류","패션잡화","화장품/미용","디지털/가전","가구/인테리어","식품"]
 DEFAULT_AGE_GROUPS={"20~30대":["20","30"],"40~60대":["40","50","60"]}
@@ -25,19 +27,11 @@ def _slug(text):
 
 
 def _cfg_categories(cfg):
-    vals=cfg.get("trend_categories") or DEFAULT_CATEGORIES
-    return [str(x).strip() for x in vals if str(x).strip()]
+    return list(load_preferences(cfg).trend_categories)
 
 
 def _cfg_age_groups(cfg):
-    raw=cfg.get("trend_age_groups") or DEFAULT_AGE_GROUPS
-    if isinstance(raw,dict):
-        out=[]
-        for label,codes in raw.items():
-            clean=[str(x).strip() for x in (codes or []) if str(x).strip()]
-            if clean:out.append((str(label),clean))
-        if out:return out
-    return list(DEFAULT_AGE_GROUPS.items())
+    return [(label,list(AGE_GROUPS[label])) for label in load_preferences(cfg).age_groups]
 
 
 def _tasks(source,cfg):
@@ -105,13 +99,14 @@ def _trend_key(text):
     return re.sub(r"[^0-9A-Za-z가-힣]+","",str(text or "")).lower()
 
 
-def merged_rows(source):
+def merged_rows(source, preferences: CollectionPreferences | None = None):
     """Return display/export rows with duplicate keywords merged per category.
 
     Raw age-bucket rows remain in trend_candidates as evidence.  The GUI/CSV
     shows one row when the same item appears in both age groups and preserves
     the per-age ranks inside the merged status/evidence summary.
     """
+    selection=load_preferences() if preferences is None else preferences
     con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
     try:
         rows=con.execute("""SELECT source,age_group,age_codes,category,rank_no,keyword,captured_at,page_url,status,evidence_json
@@ -120,6 +115,7 @@ def merged_rows(source):
     groups={}
     age_order={label:i for i,(label,_codes) in enumerate(DEFAULT_AGE_GROUPS.items())}
     for r in rows:
+        if r["category"] not in selection.trend_categories or r["age_group"] not in selection.age_groups:continue
         d=dict(r);key=(d["category"],_trend_key(d["keyword"]))
         if not key[1]:continue
         g=groups.setdefault(key,{"source":d["source"],"category":d["category"],"keyword":d["keyword"],
@@ -146,10 +142,10 @@ def merged_rows(source):
     return out
 
 
-def _write_exports(source):
+def _write_exports(source, preferences: CollectionPreferences):
     outdir=ROOT/"outputs";outdir.mkdir(parents=True,exist_ok=True)
     stem="itemscout_age_trends" if source==SOURCE_ITEMSCOUT else "naver_datalab_age_trends"
-    merged=merged_rows(source)
+    merged=merged_rows(source,preferences)
     (outdir/f"{stem}.json").write_text(json.dumps(merged,ensure_ascii=False,indent=2),encoding="utf-8")
     with (outdir/f"{stem}.csv").open("w",newline="",encoding="utf-8-sig") as f:
         w=csv.writer(f);w.writerow(["수집처","연령그룹","연령코드","카테고리","통합순위","키워드","연령별순위","수집시각","페이지URL","상태"])
@@ -161,18 +157,23 @@ def _write_exports(source):
     finally:con.close()
     with (outdir/f"{stem}_RAW.csv").open("w",newline="",encoding="utf-8-sig") as f:
         w=csv.writer(f);w.writerow(["수집처","연령그룹","연령코드","카테고리","순위","키워드","수집시각","페이지URL","상태","증거"])
-        for r in raw:w.writerow([r[x] for x in r.keys()])
+        for r in raw:
+            if r["category"] in preferences.trend_categories and r["age_group"] in preferences.age_groups:
+                w.writerow([r[x] for x in r.keys()])
     return str(outdir/f"{stem}.csv")
 
 
-def collect_source(source,progress=None):
-    cfg=settings();tasks,meta,limit=_tasks(source,cfg)
+def collect_source(source,progress=None,preferences: CollectionPreferences | None = None,stop_check: Callable[[], bool] | None = None):
+    cfg=settings();selection=load_preferences(cfg) if preferences is None else preferences
+    cfg.update(apply_preferences(cfg,selection));tasks,meta,limit=_tasks(source,cfg)
+    if stop_check and stop_check():return {"stage_ok":False,"stopped":True,"count":0,"message":"트렌드 수집 중지"}
     if not tasks:return {"stage_ok":False,"message":"트렌드 수집 조건이 비어 있습니다.","count":0}
     log(f"[TREND] {source} 시작: {len(tasks)}개 조합 × TOP{limit}")
     results=chrome_collector.collect(
         tasks,progress=progress,
         timeout_sec=max(1200,len(tasks)*int(cfg.get("trend_task_timeout_sec",150) or 150))
     )
+    if stop_check and stop_check():return {"stage_ok":False,"stopped":True,"count":0,"message":"트렌드 수집 중지: 기존 결과 보존"}
     now=time.strftime("%Y-%m-%d %H:%M:%S")
     byid={str(r.get("_task_id") or ""):r for r in results if isinstance(r,dict)}
     rows=[];errors=[];coverage={}
@@ -253,9 +254,9 @@ def collect_source(source,progress=None):
             effective_rows.extend(merged)
         con.commit()
     finally:con.close()
-    csv_path=_write_exports(source)
+    csv_path=_write_exports(source,selection)
     outdir=ROOT/"outputs";outdir.mkdir(parents=True,exist_ok=True)
-    merged_count=len(merged_rows(source))
+    merged_count=len(merged_rows(source,selection))
     failures={k:v for k,v in coverage.items() if int(v.get("count") or 0)<int(v.get("target") or limit)}
     audit={"source":source,"captured_at":now,"target":len(tasks)*limit,"fresh_collected":len(fresh_rows),
            "effective_rows":len(effective_rows),"preserved_previous_rows":preserved_count,
@@ -272,6 +273,7 @@ def collect_source(source,progress=None):
 
 def health():
     h=chrome_collector.health()
+    selection=load_preferences()
     return {"ready":bool(h.get("ready",True)),"name":"아이템스카우트/데이터랩 트렌드 수집",
-            "message":"일반 Chrome 확장프로그램으로 6개 카테고리 × 2개 연령그룹을 별도 수집합니다. "+str(h.get("message") or ""),
+            "message":f"일반 Chrome 확장프로그램으로 선택한 {len(selection.trend_categories)}개 카테고리 × {len(selection.age_groups)}개 연령그룹을 수집합니다. "+str(h.get("message") or ""),
             "state":h.get("state","PASS")}

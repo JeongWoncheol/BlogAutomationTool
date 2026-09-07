@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 from pathlib import Path
+from collections.abc import Callable
 from urllib.parse import quote
 import time,re,json,sqlite3,os,tempfile,shutil,csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,6 +14,7 @@ from . import chrome_collector
 from . import toss_multi_frame_collector
 from . import toss_sharelink_api
 from .published_product_registry import filter_published_candidates, registry_summary
+from .collection_preferences import CollectionPreferences, load_preferences, apply_preferences
 try:
     from selenium import webdriver
     from selenium.webdriver.common.by import By
@@ -414,7 +416,7 @@ def _build_extension_discovery_rows(cfg,progress=None):
     the extension must uncheck it after collecting 30 before the next task.
     """
     platforms=[p for p in ["쿠팡","네이버쇼핑","토스쇼핑"] if p in cfg.get("platforms",[])]
-    categories=list(cfg.get("categories") or ["생활용품","주방용품","패션잡화","식품","디지털/가전","화장품/미용"])
+    categories=list(load_preferences(cfg).market_categories)
     limit=int(cfg.get("top_per_platform_category",30))
     delay_ms=int(float(cfg.get("chrome_task_delay_sec",5.0))*1000)
     mapping=_site_category_map(cfg)
@@ -624,12 +626,15 @@ def _group_key(name):
     return " ".join(ident[:7]).lower() or re.sub(r"[^가-힣A-Za-z0-9]","",name).lower()[:100]
 
 
-def discover(progress=None):
+def discover(progress=None,preferences: CollectionPreferences | None = None,stop_check: Callable[[], bool] | None = None):
     cfg=settings()
+    cfg.update(apply_preferences(cfg,load_preferences(cfg) if preferences is None else preferences))
+    if stop_check and stop_check():return {"stage_ok":False,"stopped":True,"message":"상품 수집 중지"}
     if cfg.get("collection_mode","chrome_extension")!="chrome_extension":
         raise RuntimeError("인기상품 수집은 쿠팡/네이버 일반 Chrome + 토스 Sharelink API 모드를 사용합니다.")
     init_db_fast()
     rows,errors,coverage=_build_extension_discovery_rows(cfg,progress)
+    if stop_check and stop_check():return {"stage_ok":False,"stopped":True,"message":"상품 수집 중지: 기존 결과 보존"}
 
     # Dedup only inside the same marketplace/category. We intentionally keep the
     # same product if it appears on another marketplace because that is a strong
@@ -753,7 +758,7 @@ def discover(progress=None):
         final_total=int(cfg.get("final_top_products",100))
         ranked=sorted(groups.values(),key=lambda g:(g["weighted_score"],len(g["platforms"]),-g["best_rank"]),reverse=True)[:final_total]
 
-        old_products=[dict(x) for x in con.execute("SELECT * FROM products ORDER BY id").fetchall()]
+        old_products=[dict(x) for x in con.execute("SELECT * FROM products WHERE COALESCE(content_type,'')<>'celebrity_style' AND COALESCE(source_platform,'') NOT LIKE '%왈라랜드%' ORDER BY id").fetchall()]
         old_by_url={str(x.get("source_url") or ""):x for x in old_products if str(x.get("source_url") or "")}
         old_by_key={}
         for old in old_products:

@@ -8,6 +8,7 @@ inserted into the existing ``products`` table so Stage ② (title/body/tags) can
 without a separate content pipeline.
 """
 from pathlib import Path
+from collections.abc import Callable
 from urllib.parse import urlparse
 import csv, json, math, re, sqlite3, time
 from .common import (ROOT, DB, settings, clean_listing_title_noise, identity_terms,
@@ -15,6 +16,7 @@ from .common import (ROOT, DB, settings, clean_listing_title_noise, identity_ter
 from . import chrome_collector, coupang_partners_api
 from .published_product_registry import filter_published_candidates, product_profile
 from . import trend_collection_adapter
+from .collection_preferences import CollectionPreferences, load_preferences
 
 SOURCE_ITEMSCOUT=trend_collection_adapter.SOURCE_ITEMSCOUT
 SOURCE_DATALAB=trend_collection_adapter.SOURCE_DATALAB
@@ -92,13 +94,15 @@ def _card_popularity(card,keyword,index=0):
 def _is_coupang_product_url(url):
     try:
         u=urlparse(str(url or ""))
-        return "coupang.com" in (u.hostname or "").lower() and bool(re.search(r"/vp/products/\d+",u.path or "",re.I))
+        host=(u.hostname or "").lower()
+        return u.scheme=="https" and (host=="coupang.com" or host.endswith(".coupang.com")) and bool(re.fullmatch(r"/vp/products/\d+/?",u.path or "",re.I))
     except Exception:return False
 
 def _pick_best(cards,keyword):
     candidates=[]
     for i,c in enumerate(cards or []):
         if not isinstance(c,dict):continue
+        if not _is_coupang_product_url(c.get("url")):continue
         name=clean_listing_title_noise(c.get("name") or "")
         if len(name)<3:continue
         rel=_relevance(keyword,name,c.get("text") or "")
@@ -172,13 +176,13 @@ def _cards_from_partners_api(keyword,limit=10):
                       "collector_source":"coupang_partners_api"})
     return cards
 
-def _cards_from_local_coupang_snapshots(keyword,limit=30):
+def _cards_from_local_coupang_snapshots(keyword,limit=30,category: str | None = None):
     """Offline fallback using already-collected Coupang rows only; no web request."""
     con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
     try:
         rows=[dict(r) for r in con.execute("""SELECT name,price,url,image_url,rank_no,captured_at
-            FROM candidates WHERE platform='쿠팡' AND COALESCE(name,'')<>''
-            ORDER BY datetime(COALESCE(captured_at,'')) DESC, COALESCE(rank_no,9999) ASC LIMIT 1200""").fetchall()]
+            FROM candidates WHERE platform='쿠팡' AND COALESCE(name,'')<>'' AND (? IS NULL OR category=?)
+            ORDER BY datetime(COALESCE(captured_at,'')) DESC, COALESCE(rank_no,9999) ASC LIMIT 1200""",(category,category)).fetchall()]
     except Exception:
         rows=[]
     finally:con.close()
@@ -205,13 +209,14 @@ def _cards_from_local_coupang_snapshots(keyword,limit=30):
 def _age_bonus(age_group):
     return 8 if "/" in str(age_group or "") else 0
 
-def build_keyword_plan(per_category=None):
+def build_keyword_plan(per_category=None,preferences: CollectionPreferences | None = None):
     """Merge both trend sources and return at most N unique keywords/category."""
     cfg=settings();limit=max(1,min(100,int(per_category or cfg.get("trend_coupang_keywords_per_category",30) or 30)))
-    cats=cfg.get("trend_categories") or trend_collection_adapter.DEFAULT_CATEGORIES
+    selection=load_preferences(cfg) if preferences is None else preferences
+    cats=selection.trend_categories
     groups={}
     for source in (SOURCE_ITEMSCOUT,SOURCE_DATALAB):
-        for r in trend_collection_adapter.merged_rows(source):
+        for r in trend_collection_adapter.merged_rows(source,selection):
             cat=str(r.get("category") or "");kw=str(r.get("keyword") or "").strip();key=(cat,_norm_key(kw))
             if cat not in cats or not key[1]:continue
             try:rank=max(1,int(r.get("rank_no") or 999))
@@ -266,15 +271,19 @@ def _write_exports(rows,plan):
     (out/"trend_to_coupang_popular_products.json").write_text(json.dumps({"plan":plan,"selected":rows},ensure_ascii=False,indent=2),encoding="utf-8")
     return str(csv_path)
 
-def selected_rows():
+def selected_rows(preferences: CollectionPreferences | None = None):
+    selection=load_preferences() if preferences is None else preferences
     con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
     try:
         _ensure_pick_table(con);con.commit()
-        return [dict(r) for r in con.execute("SELECT * FROM trend_product_picks ORDER BY category,trend_score DESC,popularity_score DESC,id").fetchall()]
+        return [dict(r) for r in con.execute("SELECT * FROM trend_product_picks ORDER BY category,trend_score DESC,popularity_score DESC,id").fetchall()
+                if r["category"] in selection.trend_categories and set(str(r["age_groups"] or "").split(" / ")).issubset(selection.age_groups)
+                and str(r["age_groups"] or "").strip()]
     finally:con.close()
 
-def extract_popular_products(progress=None):
-    cfg=settings();plan=build_keyword_plan()
+def extract_popular_products(progress=None,preferences: CollectionPreferences | None = None,stop_check: Callable[[], bool] | None = None):
+    cfg=settings();selection=load_preferences(cfg) if preferences is None else preferences
+    plan=build_keyword_plan(preferences=selection)
     if not plan:
         return {"stage_ok":False,"message":"아이템스카우트/네이버 데이터랩 수집 결과가 없습니다. 두 트렌드 수집 버튼 중 하나 이상을 먼저 실행하세요.","selected":0}
 
@@ -294,6 +303,7 @@ def extract_popular_products(progress=None):
     picked=[];failed=[]
     log(f"[TREND→COUPANG] v8.08.34 브라우저 검색 0회 시작: 키워드 {len(plan)}개 / Partners API={'READY' if api_ready else 'NOT READY'}")
     for i,tr in enumerate(plan,1):
+        if stop_check and stop_check():return {"stage_ok":False,"stopped":True,"selected":0,"message":"인기상품 추출 중지: 기존 결과 보존"}
         kw=tr["keyword"]
         if progress:
             try:progress(i-1,len(plan),f"쿠팡 인기상품(API) {i}/{len(plan)}: {kw[:30]}")
@@ -306,7 +316,7 @@ def extract_popular_products(progress=None):
                 errors.append("Partners API: "+str(e))
         if not cards and snapshot_fallback:
             try:
-                cards=_cards_from_local_coupang_snapshots(kw,max(api_limit,24));source="local_coupang_snapshot" if cards else source
+                cards=_cards_from_local_coupang_snapshots(kw,max(api_limit,24),tr["category"]);source="local_coupang_snapshot" if cards else source
             except Exception as e:
                 errors.append("local snapshot: "+str(e))
         selected=_pick_best(cards,kw) if cards else None
@@ -338,6 +348,7 @@ def extract_popular_products(progress=None):
         if new_strength>old_strength:
             r["matched_keywords"]=old["matched_keywords"];dedup[k]=r
     unique=list(dedup.values())
+    if stop_check and stop_check():return {"stage_ok":False,"stopped":True,"selected":0,"message":"인기상품 추출 중지: 기존 결과 보존"}
     # Reuse the durable already-drafted-product policy (spec/count/colour differences
     # are still the same product) before exposing rows to Stage ②.
     as_candidates=[{"platform":"쿠팡","category":r["category"],"name":r["name"],"url":r["url"],"price":r.get("price"),"_pick":r} for r in unique]
@@ -349,11 +360,9 @@ def extract_popular_products(progress=None):
     preserved_pick_count=0
     try:
         _ensure_pick_table(con)
-        previous_pick_keys={(str(x["category"]),str(x["keyword"])) for x in con.execute("SELECT category,keyword FROM trend_product_picks").fetchall()}
-        # Remove only unprocessed leftovers from an older trend extraction. Never
-        # delete rows that already have generated content/images or a saved draft.
-        con.execute("""DELETE FROM products WHERE source_platform=? AND COALESCE(status,'')='트렌드쿠팡선정' AND COALESCE(title,'')='' AND COALESCE(body,'')='' AND COALESCE(tags,'')=''
-                       AND COALESCE(image1,'')='' AND COALESCE(image2,'')='' AND COALESCE(image3,'')=''""",(PICK_SOURCE,))
+        active_plan_keys={(r["category"],r["keyword"]) for r in plan}
+        previous_pick_keys={(str(x["category"]),str(x["keyword"])) for x in selected_rows(selection)
+                            if (str(x["category"]),str(x["keyword"])) in active_plan_keys}
         max_no=int(con.execute("SELECT COALESCE(MAX(product_no),0) FROM products").fetchone()[0] or 0)
         existing_urls={str(r["source_url"] or ""):int(r["id"]) for r in con.execute("SELECT id,source_url FROM products WHERE COALESCE(source_url,'')<>''").fetchall()}
         product_ids={}
