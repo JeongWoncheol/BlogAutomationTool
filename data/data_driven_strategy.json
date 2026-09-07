@@ -1,0 +1,18 @@
+{
+  "lookback_posts": 30,
+  "signals": {
+    "search_inflow": 0.45,
+    "views": 0.2,
+    "engagement": 0.15,
+    "outbound_clicks": 0.1,
+    "dwell_time": 0.1
+  },
+  "guardrails": {
+    "minimum_category_weight": 0.55,
+    "maximum_category_weight": 1.75,
+    "minimum_posts_for_full_confidence": 5,
+    "keep_exploration": true,
+    "do_not_optimize_on_post_count": true
+  },
+  "decision_rule": "최근 30개에서 실제 검색유입 중심으로 다음 상품 발굴 비중을 조정한다. 단, 표본이 적은 카테고리는 급격히 늘리거나 줄이지 않는다."
+}

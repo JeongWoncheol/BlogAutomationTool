@@ -1,0 +1,75 @@
+{
+  "manifest_version": 3,
+  "name": "NaverBlog Normal Chrome Collector",
+  "version": "4.6.8",
+  "description": "v8.08.43 strict blog-image recovery: exact Coupang product page first, Google Images exact source-page validation second; recommendation/related/preview/other-market image fallbacks blocked",
+  "permissions": [
+    "tabs",
+    "storage",
+    "scripting",
+    "alarms",
+    "debugger"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8765/*",
+    "https://*.coupang.com/*",
+    "https://link.coupang.com/*",
+    "https://shopping.naver.com/*",
+    "https://search.shopping.naver.com/*",
+    "https://sharelink.toss.im/*",
+    "https://snxbest.naver.com/*",
+    "https://*.toss.im/*",
+    "https://smartstore.naver.com/*",
+    "https://brand.naver.com/*",
+    "https://m.smartstore.naver.com/*",
+    "https://toss.shopping/*",
+    "https://itemscout.io/*",
+    "https://*.itemscout.io/*",
+    "https://datalab.naver.com/*",
+    "https://www.google.com/*",
+    "https://www.google.co.kr/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "상품 수집"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.coupang.com/*",
+        "https://link.coupang.com/*"
+      ],
+      "js": [
+        "dialog_guard.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "http://127.0.0.1:8765/*",
+        "https://*.coupang.com/*",
+        "https://link.coupang.com/*",
+        "https://shopping.naver.com/*",
+        "https://search.shopping.naver.com/*",
+        "https://sharelink.toss.im/*",
+        "https://snxbest.naver.com/*",
+        "https://*.toss.im/*",
+        "https://smartstore.naver.com/*",
+        "https://brand.naver.com/*",
+        "https://m.smartstore.naver.com/*",
+        "https://toss.shopping/*",
+        "https://itemscout.io/*",
+        "https://*.itemscout.io/*",
+        "https://datalab.naver.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

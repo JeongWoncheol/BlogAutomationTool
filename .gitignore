@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+# Runtime output and diagnostics
+outputs/
+logs/
+evidence/
+captures/
+temp/
+tmp/
+*.log
+blog_upload_diagnostic*.csv
+image_collect_diagnostic*.csv
+# Local databases / browser state
+data/studio.db
+data/studio.db-*
+*.sqlite
+*.sqlite3
+SingletonLock
+SingletonSocket
+SingletonCookie
+DevToolsActivePort
+# User-specific history/state
+data/blog_upload_history.json
+data/published_product_registry.json
+# Credentials — NEVER commit
+data/*credentials*.json
+data/*credential*.json
+data/coupang_partners_credentials.json
+data/naver_image_api_credentials.json
+data/toss_sharelink_api_credentials.json
+data/openai_api_credentials.json
+.env
+.env.*
+!.env.example
+# Generated image/video artifacts
+*.mp4
+*.webm
+*.avi
+*.mov

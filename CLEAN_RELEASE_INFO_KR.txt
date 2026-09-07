@@ -1,0 +1,17 @@
+NBlog v8.08.52 CLEAN RUNTIME
+
+실행에 필요한 런타임/설정/기능 도구만 유지한 경량 배포본입니다.
+
+v8.08.52 핵심
+- Ollama 제품 원고: 자연스러운 대화형 후기체, 감탄/질문 다양화
+- AI/보고서체 표현이 과하면 human-tone audit 후 자동 재작성
+- 실제 사용 근거가 없으면 직접 사용/내돈내산 경험을 지어내지 않음
+- 연예인 착장 원고에도 자연스러운 패션 대화체 적용
+- 기본 글자크기 15px 유지
+- 모든 체크표시 문장 굵게 + #fff8b2
+- NAVER 이미지 API 우선 이미지3장 수집 개선 유지
+
+주요 실행 파일
+01_INSTALL.cmd
+15_INSTALL_NORMAL_CHROME_EXTENSION.cmd
+START_STUDIO.cmd

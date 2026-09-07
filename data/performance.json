@@ -1,0 +1,36 @@
+{
+  "version": "5.5",
+  "pc_search_workers": 1,
+  "search_page_timeout_sec": 12,
+  "content_page_timeout_sec": 15,
+  "price_page_timeout_sec": 12,
+  "dom_ready_timeout_sec": 6,
+  "poll_interval_sec": 0.15,
+  "search_result_cache_ttl_sec": 900,
+  "reuse_pc_browser_in_content": true,
+  "reuse_toss_appium_session_in_price": true,
+  "sqlite_wal": true,
+  "sqlite_synchronous": "NORMAL",
+  "sqlite_busy_timeout_ms": 5000,
+  "batch_db_writes": true,
+  "log_progress_min_interval_sec": 0.35,
+  "browser_page_load_strategy": "eager",
+  "disable_images_for_discovery_only": false,
+  "preserve_accuracy_guards": true,
+  "notes": [
+    "정확도 검증(Product Identity Lock)은 최적화 대상에서 제외.",
+    "실시간 가격 단계는 TTL cache를 사용하지 않음.",
+    "AI 영상 생성은 GPU 메모리 충돌을 피하기 위해 병렬화하지 않음."
+  ],
+  "safe_market_mode": true,
+  "market_min_interval_sec": 2.0,
+  "market_block_cooldown_sec": 600,
+  "market_login_wait_sec": 180,
+  "notes_v67": [
+    "쿠팡/네이버 검색을 동시에 때리지 않고 순차 실행",
+    "각 쇼핑몰 전용 persistent Chrome profile 재사용",
+    "Access Denied/비정상 접근/CAPTCHA 감지 시 즉시 circuit breaker",
+    "탐지 회피/캡차 우회/stealth 옵션은 사용하지 않음",
+    "토스는 sharelink.toss.im PC 로그인 세션을 1순위로 사용"
+  ]
+}
