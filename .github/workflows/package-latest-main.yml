@@ -1,0 +1,127 @@
+name: Package latest main runnable
+
+on:
+  push:
+    branches:
+      - assistant/package-latest-main
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build runnable package
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf package
+          mkdir -p package/BlogAutomationTool_LATEST_MAIN_RUNNABLE
+          rsync -a ./ package/BlogAutomationTool_LATEST_MAIN_RUNNABLE/ \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude '__pycache__' \
+            --exclude '*.pyc' \
+            --exclude '.venv' \
+            --exclude 'outputs' \
+            --exclude 'logs'
+
+          cat > package/BlogAutomationTool_LATEST_MAIN_RUNNABLE/BUILD_INFO.txt <<'EOF'
+          BlogAutomationTool - latest main runnable package
+          Base commit: dadceef22a31800cb5443c531c832ee8623e444a
+          Base commit message: fix celebrity dashboard initialization and record validation
+          Package branch: assistant/package-latest-main
+          EOF
+
+          cat > package/BlogAutomationTool_LATEST_MAIN_RUNNABLE/00_SETUP_AND_START.cmd <<'EOF'
+          @echo off
+          chcp 65001 >nul
+          setlocal EnableExtensions
+          cd /d "%~dp0"
+          title BlogAutomationTool - Setup and Start
+
+          echo ============================================================
+          echo BlogAutomationTool - automatic setup and start
+          echo ============================================================
+          echo.
+
+          set "PY_CMD="
+          py -3.12 -V >nul 2>nul && set "PY_CMD=py -3.12"
+          if not defined PY_CMD py -3.13 -V >nul 2>nul && set "PY_CMD=py -3.13"
+          if not defined PY_CMD py -3.14 -V >nul 2>nul && set "PY_CMD=py -3.14"
+          if not defined PY_CMD py -3 -V >nul 2>nul && set "PY_CMD=py -3"
+          if not defined PY_CMD python -V >nul 2>nul && set "PY_CMD=python"
+
+          if not defined PY_CMD (
+            echo [ERROR] Python 3 was not found.
+            echo Install Python 3.12 or newer, then run this file again.
+            echo.
+            pause
+            exit /b 1
+          )
+
+          if not exist ".venv\Scripts\python.exe" (
+            echo [1/3] Creating isolated Python environment...
+            %PY_CMD% -m venv .venv
+            if errorlevel 1 goto :failed
+          ) else (
+            echo [1/3] Existing isolated Python environment found.
+          )
+
+          set "VPY=%CD%\.venv\Scripts\python.exe"
+
+          if not exist ".venv\.requirements_ok" (
+            echo [2/3] Installing required packages...
+            "%VPY%" -m pip install --upgrade pip
+            if errorlevel 1 goto :failed
+            "%VPY%" -m pip install -r requirements.txt
+            if errorlevel 1 goto :failed
+            "%VPY%" -c "import pydantic, selenium, PIL; print('dependency check OK')"
+            if errorlevel 1 goto :failed
+            type nul > ".venv\.requirements_ok"
+          ) else (
+            echo [2/3] Dependencies already installed.
+          )
+
+          echo [3/3] Starting BlogAutomationTool...
+          "%VPY%" app.py
+          set "RC=%ERRORLEVEL%"
+          echo.
+          if not "%RC%"=="0" (
+            echo Program exited with error code %RC%.
+            echo Copy the traceback shown above when asking for help.
+            pause
+          )
+          exit /b %RC%
+
+          :failed
+          echo.
+          echo [ERROR] Setup failed.
+          echo Copy the messages shown above when asking for help.
+          pause
+          exit /b 1
+          EOF
+
+          cat > package/BlogAutomationTool_LATEST_MAIN_RUNNABLE/00_실행방법.txt <<'EOF'
+          1. ZIP 파일을 완전히 압축 해제합니다.
+          2. 00_SETUP_AND_START.cmd 를 더블클릭합니다.
+          3. 첫 실행에서는 프로그램 전용 .venv를 만들고 requirements.txt를 자동 설치합니다.
+          4. 설치가 끝나면 같은 Python 환경으로 app.py를 실행합니다.
+          5. 이후 실행은 같은 00_SETUP_AND_START.cmd를 사용하면 됩니다.
+
+          기존 START_STUDIO.cmd도 포함되어 있지만, Python/pip 환경 불일치를 막기 위해
+          이 패키지에서는 00_SETUP_AND_START.cmd 사용을 권장합니다.
+          EOF
+
+      - name: Upload runnable ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NBlog_LATEST_MAIN_RUNNABLE_20260907
+          path: package/BlogAutomationTool_LATEST_MAIN_RUNNABLE
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 7
