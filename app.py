@@ -32,7 +32,7 @@ class App(tk.Tk):
   self.collection_selection_vars:dict[str,dict[str,tk.BooleanVar]]={}
   self.collection_selection_summary=tk.StringVar()
   self.page_canvases={};self.page_canvas_windows={};self.page_scrollbars={};self._responsive_mode={}
-  self.style();self.build();self.refresh();self.after(150,self.poll);self.after(600,self.health);self.after(1000,self._tick_content_live)
+  self.style();self.build();self.celebrity_dashboard:CelebrityDashboardPanel=self._build_overview_page(self.page_bodies["overview"]);self.refresh();self.after(150,self.poll);self.after(600,self.health);self.after(1000,self._tick_content_live)
  def style(self):
   self.COLORS={
    "sidebar":"#17192d","sidebar2":"#24274a","accent":"#6c5ce7","accent2":"#8f63ff",
@@ -220,7 +220,7 @@ class App(tk.Tk):
   except:pass
 
  def build(self):
-  self.modern_pages={};self.page_bodies={};self.page_meta={};self.nav_buttons={};self.current_page="overview"
+  self.modern_pages={};self.page_bodies:dict[str,tk.Frame]={};self.page_meta={};self.nav_buttons={};self.current_page="overview"
   shell=tk.Frame(self,bg=self.COLORS["bg"]);shell.pack(fill="both",expand=True)
   sidebar=tk.Frame(shell,bg=self.COLORS["sidebar"],width=220);sidebar.pack(side="left",fill="y");sidebar.pack_propagate(False)
   brand=tk.Frame(sidebar,bg=self.COLORS["sidebar"]);brand.pack(fill="x",pady=(16,8))
@@ -275,7 +275,7 @@ class App(tk.Tk):
   self.bind_all("<MouseWheel>",self._on_global_mousewheel,add="+");self.bind_all("<Button-4>",self._on_global_mousewheel,add="+");self.bind_all("<Button-5>",self._on_global_mousewheel,add="+")
 
   # Modern top-level pages
-  self._build_overview_page(self._page("overview","대시보드","오늘의 수집·작성·이미지·임시저장 상태를 한눈에 확인합니다."))
+  _=self._page("overview","대시보드","오늘의 수집·작성·이미지·임시저장 상태를 한눈에 확인합니다.")
   self._build_account_page(self._page("account","계정 · 연결","네이버 블로그, Chrome, 쿠팡/네이버/토스 API 연결 상태를 관리합니다."))
   self._build_ai_page(self._page("ai","AI 설정","Ollama Qwen3 무료 로컬 AI를 1순위로 사용해 제목·본문·태그를 다양하게 생성합니다."))
   self._build_categories_page(self._page("categories","카테고리 & 키워드","수집할 카테고리와 트렌드 연령대를 선택합니다."))
@@ -307,10 +307,10 @@ class App(tk.Tk):
   self.dashboard();self.trend_tab();self.trend_product_tab();self.preview();self.verify_tab();self.video_tab();self.performance_tab();self.template();self.trouble();self.logs();self.settings_tab()
   self.show_page("overview")
 
- def _build_overview_page(self,p):
+ def _build_overview_page(self,p:tk.Frame) -> CelebrityDashboardPanel:
   outfits=self._card(p,"연예인 검색 → 착장 원고 · 제휴","Google·네이버에서 인물 사진을 찾아 AI로 착장을 분석합니다.\n확인된 대표 제품의 사진 3장과 쿠팡 제휴링크를 원고에 연결합니다.")
   outfits.pack(fill="x",pady=(0,12))
-  self.celebrity_dashboard=CelebrityDashboardPanel(outfits,self.celebrity_dashboard_run,lambda:self.celebrity_dashboard_run(True,prepared_only=True))
+  celebrity_dashboard=CelebrityDashboardPanel(outfits,self.celebrity_dashboard_run,lambda:self.celebrity_dashboard_run(True,prepared_only=True))
   grid=tk.Frame(p,bg=self.COLORS["bg"]);grid.pack(fill="x")
   for i in range(5):grid.grid_columnconfigure(i,weight=1)
   metrics=[("전체 상품","overview_total","0"),("원고 준비","overview_content","0"),("사진 3장 완료","overview_images","0"),("임시저장 준비","overview_ready","0"),("게시·저장 이력 제외","overview_posted","0")]
@@ -334,7 +334,7 @@ class App(tk.Tk):
   ttk.Button(quick,text="사진 3장 임시저장 (제휴링크 제외)",style="Accent.TButton",command=lambda:self.blog_single("images_only",blog_context={"affiliate_policy":"omit"})).pack(fill="x",padx=14,pady=4)
   ttk.Button(quick,text="제휴링크 포함 사진 3장 임시저장",style="Accent.TButton",command=lambda:self.blog_single("images_only",blog_context={"affiliate_policy":"required"})).pack(fill="x",padx=14,pady=4)
   ttk.Button(quick,text="■ 실행 중지",style="Danger.TButton",command=lambda:setattr(self,"stop",True)).pack(fill="x",padx=14,pady=(4,14))
-  def _overview_reflow(e):
+  def _overview_reflow(e:"tk.Event[tk.Frame]") -> None:
    w=max(1,int(e.width));cols=5 if w>=1150 else (3 if w>=760 else 2)
    mode=f"{cols}"
    if self._responsive_mode.get("overview")==mode:return
@@ -349,7 +349,8 @@ class App(tk.Tk):
    else:
     lower.grid_columnconfigure(0,weight=1);lower.grid_columnconfigure(1,weight=0)
     recent.grid(row=0,column=0,sticky="nsew",pady=(0,8));quick.grid(row=1,column=0,sticky="ew")
-  p.bind("<Configure>",_overview_reflow,add="+")
+  _=p.bind("<Configure>",_overview_reflow,add="+")
+  return celebrity_dashboard
 
  def celebrity_dashboard_run(self,save_draft:bool,prepared_only:bool=False) -> None:
   if self.worker and self.worker.is_alive():
