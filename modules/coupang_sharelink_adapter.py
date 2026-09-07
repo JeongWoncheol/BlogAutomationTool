@@ -4,6 +4,10 @@ from pathlib import Path
 import csv,json,os,time
 from .common import *
 from . import coupang_partners_api
+from .wala_policy import SOURCE_REASON, is_wala_product
+from .affiliate_identity import bound_evidence
+from .affiliate_request import AffiliateStopped
+from collections.abc import Callable
 
 def health():
     state=coupang_partners_api.health()
@@ -40,11 +44,14 @@ def _update_post_file(row,link,evidence):
     os.replace(tmp,path)
     return post
 
-def run(context=None,progress=None):
+def run(context=None,progress=None,stop_check: Callable[[], bool] | None = None):
     init_db_fast();cfg=settings();con=db_connect(row_factory=True)
     all_rows=con.execute("SELECT * FROM products WHERE post_dir IS NOT NULL AND status NOT LIKE '추천제외:%' AND COALESCE(already_posted,0)=0 ORDER BY product_no,id").fetchall()
     rows=[];skipped=[]
     for row in all_rows:
+        if is_wala_product(row):
+            skipped.append({"TOP":row["product_no"] or row["id"],"상품명":row["name"],"결과":"제외","원인":SOURCE_REASON})
+            continue
         physical=_physical_image_count(row);verified=int(row["image_verified_count"] or 0)
         image_ok,image_detail=verified_blog_image_set(row,3)
         if not image_ok:
@@ -53,36 +60,47 @@ def run(context=None,progress=None):
         elif not row["title"] or not row["body"] or not row["tags"]:
             skipped.append({"TOP":row["product_no"] or row["id"],"상품명":row["name"],"결과":"제외","원인":"제목·본문·태그 미완료"})
         else:rows.append(row)
-    success=0;failed=[];preserved=0;diagnostics=list(skipped)
+    success=0;failed=[];preserved=0;diagnostics=list(skipped);stopped=False
     try:
         for index,row in enumerate(rows,1):
+            if stop_check and stop_check():stopped=True;break
             if progress:progress(index-1,len(rows),f"사진3장 성공 쉐어링크: {row['name'][:32]}")
             current=str(row["sharelink"] or "").strip()
-            if coupang_partners_api._valid_affiliate_url(current):
-                try:
-                    coupang_partners_api.remember_existing_deeplink(
-                        coupang_partners_api._product_id_from_url(str(row["source_url"] or "")),
-                        current,str(row["source_url"] or ""),str(row["name"] or ""),
-                        str(cfg.get("coupang_partner_sub_id","") or ""))
-                except Exception as exc:log("기존 제휴링크 DB 캐시 기록 경고: "+str(exc))
-                preserved+=1;success+=1
-                diagnostics.append({"TOP":row["product_no"] or row["id"],"상품명":row["name"],"결과":"기존링크 유지","원인":""})
-                if progress:progress(index,len(rows),f"기존 쉐어링크 유지: {row['name'][:30]}")
-                continue
             try:
                 source_platform=str(row["source_platform"] or "")
                 verified_url=str(row["source_url"] or "") if "쿠팡" in source_platform else ""
+                post_path=Path(str(row["post_dir"] or ""))/"post.json"
+                old_post=json.loads(post_path.read_text(encoding="utf-8"))
+                old_evidence=old_post.get("coupang_sharelink_evidence") or {}
+                current_bound=(coupang_partners_api._valid_affiliate_url(current) and
+                               bound_evidence(old_evidence,current,str(row["name"] or ""),verified_url))
+                if current_bound:
+                    post=_update_post_file(row,current,old_evidence)
+                    con.execute("UPDATE products SET body=?,last_error=NULL WHERE id=?",
+                                (json.dumps(post.get("blocks") or [],ensure_ascii=False),row["id"]))
+                    con.commit();preserved+=1;success+=1
+                    diagnostics.append({"TOP":row["product_no"] or row["id"],"상품명":row["name"],"결과":"기존링크 유지","원인":"상품 연결 근거 일치"})
+                    if progress:progress(index,len(rows),f"검증된 기존 쉐어링크 유지: {row['name'][:30]}")
+                    continue
+                if current or old_post.get("sharelink") or any(block.get("type")=="sharelink" for block in old_post.get("blocks") or []):
+                    post=_update_post_file(row,"",{"ok":False,"reason":"기존 링크와 현재 상품의 연결 근거 불일치 또는 없음"})
+                    con.execute("UPDATE products SET sharelink='',body=? WHERE id=?",
+                                (json.dumps(post.get("blocks") or [],ensure_ascii=False),row["id"]))
+                    con.commit()
                 evidence=coupang_partners_api.exact_product_sharelink(
                     row["name"],sub_id=str(cfg.get("coupang_partner_sub_id","") or ""),
                     max_queries=int(cfg.get("coupang_partner_sharelink_search_queries",7)),
-                    verified_product_url=verified_url)
+                    verified_product_url=verified_url,stop_check=stop_check)
                 link=str(evidence.get("sharelink") or "").strip() if evidence.get("ok") else ""
                 if not link:raise RuntimeError(str(evidence.get("reason") or "쿠팡 동일상품 쉐어링크 없음"))
+                if stop_check and stop_check():stopped=True;break
                 post=_update_post_file(row,link,evidence)
                 con.execute("UPDATE products SET sharelink=?,body=?,last_error=NULL,updated_at=datetime('now','localtime') WHERE id=?",
                             (link,json.dumps(post.get("blocks") or [],ensure_ascii=False),row["id"]))
                 con.commit();success+=1
                 diagnostics.append({"TOP":row["product_no"] or row["id"],"상품명":row["name"],"결과":"성공","원인":""})
+            except AffiliateStopped:
+                stopped=True;break
             except Exception as exc:
                 reason=f"쉐어링크 실패: {type(exc).__name__}: {exc}"
                 failed.append({"id":row["id"],"TOP":row["product_no"] or row["id"],"name":row["name"],"reason":reason})
@@ -94,6 +112,6 @@ def run(context=None,progress=None):
     OUTPUTS.mkdir(parents=True,exist_ok=True);diag=OUTPUTS/"coupang_sharelink_image3_diagnostic.csv"
     with diag.open("w",encoding="utf-8-sig",newline="") as f:
         w=csv.DictWriter(f,fieldnames=["TOP","상품명","결과","원인"]);w.writeheader();w.writerows(diagnostics)
-    message=f"사진3장 성공 상품 쉐어링크 {success}/{len(rows)} · 기존링크 {preserved}건 · 실패 {len(failed)}건 · 이미지 미달 제외 {len(skipped)}건"
+    message=f"사진3장 성공 상품 쉐어링크 {success}/{len(rows)} · 기존링크 {preserved}건 · 실패 {len(failed)}건 · 제외 {len(skipped)}건"+(" · 사용자 중지" if stopped else "")
     return {"processed":success,"failed":failed,"eligible":len(rows),"skipped":skipped,
-            "stage_ok":not failed,"soft_pending":bool(failed),"diagnostic_csv":str(diag),"message":message}
+            "stage_ok":not failed and not stopped,"soft_pending":bool(failed) or stopped,"stopped":stopped,"diagnostic_csv":str(diag),"message":message}

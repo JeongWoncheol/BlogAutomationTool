@@ -12,6 +12,9 @@ from . import naver_image_api
 from . import toss_sharelink_api
 from . import reference_blog_style
 from . import ollama_local
+from .wala_policy import REVIEW_REASON, is_wala_product, preserve_product_images
+from .image_identity import IDENTITY_POLICY, image_evidence_error, page_identity_conflict
+from .affiliate_identity import product_id as coupang_product_id, variant_conflicts
 
 RULES="""네이버 모바일 블로그용 한국어 제품 원고를 작성한다.
 가장 중요한 기준은 '실제 사람이 제품을 알아보고 자기 말로 정리한 글'처럼 읽히는 것이다.
@@ -1854,15 +1857,17 @@ def _pace_coupang_detail(cfg):
             time.sleep(wait)
 
 def _is_direct_coupang_product_url(url):
-    """Allow only direct Coupang product/deeplink URLs; reject search/category pages."""
-    try:
-        u=urllib.parse.urlparse(str(url or ""));host=(u.netloc or "").lower();path=(u.path or "").lower()
-        if host.endswith("link.coupang.com"):
-            return "/re/" in path or bool(path)
-        if host.endswith("coupang.com"):
-            return "/vp/products/" in path or "/products/" in path
-    except Exception:pass
-    return False
+    return bool(coupang_product_id(str(url or "")))
+
+
+def _coupang_api_product_url(url: str, identifier: str) -> str:
+    identifier=identifier.strip()
+    direct_id=coupang_product_id(url)
+    if direct_id:
+        return url if not identifier or identifier==direct_id else ""
+    if identifier.isdigit() and (not url or coupang_partners_api._valid_affiliate_url(url)):
+        return f"https://www.coupang.com/vp/products/{identifier}"
+    return ""
 
 def _is_direct_market_product_url(url,site):
     """Known direct product URL only; never issue a new marketplace search here."""
@@ -1921,12 +1926,15 @@ def _resolve_coupang_product_link(product,cfg,repair_mode=False):
                 if key in seen:continue
                 seen.add(key);candidate=r.get("name") or ""
                 ok,score,detail=_balanced_exact_product_accept(candidate,product["name"])
-                rec={"query":q,"candidate":candidate,"score":score,"url":r.get("url") or "","image_url":r.get("image_url") or "",
+                product_url=_coupang_api_product_url(str(r.get("url") or ""),str(r.get("product_id") or ""))
+                if not product_url:
+                    qdiag["rejected"].append({"candidate":candidate[:120],"reason":"쿠팡 API 상품 URL·ID 연결 불일치 또는 없음"});continue
+                rec={"query":q,"candidate":candidate,"score":score,"url":product_url,"image_url":r.get("image_url") or "",
                      "product_id":r.get("product_id") or "","match_detail":detail}
                 if ok:
                     rec["match_mode"]="strict";strict.append(rec);qdiag["accepted"]+=1;continue
                 nok,nscore,ndetail=_near_product_candidate_assessment(candidate,product["name"])
-                if nok and (r.get("url") or ""):
+                if nok:
                     rec.update(score=nscore,match_detail=ndetail,match_mode="near_page_confirm");near.append(rec);qdiag["near"]+=1
                 else:
                     qdiag["rejected"].append({"candidate":candidate[:120],"score":nscore,"reason":_reject_reason_from_detail(ndetail),"detail":ndetail})
@@ -2093,6 +2101,8 @@ def _toss_api_exact_product(product,cfg,repair_mode=False):
 def _detail_images_via_normal_chrome(product,url,site="",capture_rendered=None,trust_direct=None):
     global _COUPANG_DETAIL_BLOCKED_UNTIL,_COUPANG_DETAIL_LAST_FINISH
     if not url:return {"ok":False,"images":[],"reason":"URL 없음"}
+    if coupang_partners_api._valid_affiliate_url(url):
+        return {"ok":False,"images":[],"reason":"제휴 추적 링크는 열지 않습니다. API 상품 ID로 원상품 주소를 확인하세요."}
     site=site or _site_from_url(url)
     if not site:return {"ok":False,"images":[],"reason":"사이트 식별 실패"}
     cfg=settings()
@@ -2146,27 +2156,15 @@ def _detail_images_via_normal_chrome(product,url,site="",capture_rendered=None,t
                     return {"ok":False,"images":[],"reason":reason,"blocked":True,"attempt":attempt}
                 if r.get("status")!="ok":last={"ok":False,"images":[],"reason":r.get("error") or r.get("status"),"attempt":attempt,"auto_dismissed_dialogs":r.get("auto_dismissed_dialogs") or []}
                 else:
-                    page_text=((r.get("page_title") or "")+" "+(r.get("page_text") or "")).strip()
-                    if site=="구글원본":
-                        # IMPORTANT: body text can contain recommendation cards for the target
-                        # even when the page itself is a different product. Validate only
-                        # title/H1/OG/JSON-LD Product identity captured by the extension.
-                        identity_text=str(r.get("identity_text") or "").strip()
-                        identity_basis=identity_text or str(r.get("page_title") or "").strip()
-                        ok,score,detail=_strict_google_source_page_accept(identity_basis,product["name"],cfg,r.get("identity_sources") or [])
-                        detail={**detail,"identity_text":identity_text[:1200],"identity_sources":r.get("identity_sources") or []}
-                    else:
-                        ok,score,detail=strict_product_accept(page_text,product["name"],float(cfg.get("image_match_threshold",0.58)))
-                    trusted_coupang=bool(site=="쿠팡" and _is_direct_coupang_product_url(url) and (cfg.get("image_trust_prevalidated_coupang_direct_url",True) if trust_direct is None else trust_direct))
-                    # A strict Sharelink API hit already passed the untouched full
-                    # name/model/option gate.  Toss SPA page_text can omit a count
-                    # or capacity even while showing the exact product gallery;
-                    # trust only an explicitly prevalidated direct toss.shopping
-                    # URL, never an unconfirmed near candidate.
-                    trusted_toss=bool(site=="토스쇼핑" and trust_direct is True and _is_direct_market_product_url(url,"토스쇼핑"))
-                    trusted_direct=bool(trusted_coupang or trusted_toss)
-                    if trusted_direct and not ok:
-                        detail={**detail,"trusted_prevalidated_direct_url":True,"page_match_original_ok":False};ok=True
+                    identity_text=str(r.get("identity_text") or "").strip()
+                    identity_basis=str(r.get("page_title") or "").strip()
+                    ok,score,detail=_strict_google_source_page_accept(identity_basis,product["name"],cfg,r.get("identity_sources") or [])
+                    redirect_conflict=page_identity_conflict(url,str(r.get("url") or url))
+                    detail={**detail,"identity_text":identity_text[:1200],"identity_sources":r.get("identity_sources") or [],
+                            "redirect_conflict":redirect_conflict,"identity_verification":IDENTITY_POLICY}
+                    if redirect_conflict:ok=False
+                    r["detail_images"]=[im for im in (r.get("detail_images") or [])
+                                        if isinstance(im,dict) and not _critical_conflicts(str(im.get("alt") or ""),product["name"])]
                     screen_captures=r.get("screen_captures") or []
                     last={"ok":ok,"images":r.get("detail_images") or [],"screen_captures":screen_captures,
                           "screen_capture_diag":r.get("screen_capture_diag") or {},"page_url":r.get("url") or url,
@@ -2423,8 +2421,9 @@ def _strict_google_source_page_accept(identity_text,target_name,cfg=None,identit
     for source,text in fields:
         ok,score,detail=strict_product_accept(text,target_name,threshold)
         low=text.lower();hits=[t for t in semantic_terms if t.lower() in low];conflicts=_critical_conflicts(text,target_name)
-        field_ok=bool(ok and not conflicts and len(hits)>=min_hits)
-        row={"source":source,"text":text[:700],"ok":field_ok,"score":score,"hits":hits,"conflicts":conflicts,"detail":detail}
+        variants=variant_conflicts(text,target_name)
+        field_ok=bool(ok and not conflicts and not variants and len(hits)>=min_hits)
+        row={"source":source,"text":text[:700],"ok":field_ok,"score":score,"hits":hits,"conflicts":conflicts,"variant_conflicts":variants,"detail":detail}
         checked.append(row)
         if score>best[1]:best=(field_ok,score,row)
         if field_ok:
@@ -2442,7 +2441,9 @@ def _balanced_exact_product_accept(text,target_name,threshold=None):
     terms to be printed in the marketplace title.
     """
     th=float(threshold if threshold is not None else max(0.60,float(settings().get('image_match_threshold',0.70))-0.08))
-    return strict_product_accept(text,target_name,th)
+    accepted,score,detail=strict_product_accept(text,target_name,th)
+    conflicts=variant_conflicts(text,target_name)
+    return bool(accepted and not conflicts),score,{**detail,"variant_conflicts":conflicts}
 
 
 def _critical_conflicts(candidate,target_name):
@@ -2536,6 +2537,9 @@ def capture_images_cached(product,post_dir,con,repair_mode=False,progress=None):
       6) keep failures as repairable photo backlog instead of hiding them from TOP100
     """
     cfg=settings();want=int(cfg.get("image_exact_count",3));post_dir=Path(post_dir)
+    if is_wala_product(product):
+        if progress:progress(REVIEW_REASON)
+        return preserve_product_images(product,post_dir,want)
     coupang_only=bool(cfg.get("image_coupang_only_1plus2_mode",True))
     page_grounded_only=bool(cfg.get("image_page_grounded_only_mode",True))
     # v8.08.43: blog photos may originate ONLY from an exact Coupang product
@@ -2543,8 +2547,7 @@ def capture_images_cached(product,post_dir,con,repair_mode=False,progress=None):
     # product page is re-opened and identity-validated. Naver Image/Toss/other
     # marketplace thumbnail fallbacks are intentionally blocked in this mode.
     strict_cg_only=bool(cfg.get("image_strict_coupang_google_only_mode",True))
-    strict_naver_exact=bool(cfg.get("image_strict_exact_naver_fallback_enabled",True))
-    strict_page_policy="V8_08_48_COUPANG_API_NAVER_FAST_EXACT_COUPANG_DETAIL_GOOGLE_CHAIN"
+    strict_page_policy="PRIMARY_PAGE_OR_EXACT_API_V1"
     post_dir.mkdir(parents=True,exist_ok=True)
     try: photo_title=product["title"] or product["name"]
     except Exception: photo_title=product["name"]
@@ -2575,7 +2578,9 @@ def capture_images_cached(product,post_dir,con,repair_mode=False,progress=None):
             policy=str(old.get("source_policy") or "")
             # v7.49 intentionally does NOT trust older detail-image evidence.
             # Older versions could save legal/specification sheets as blog photos.
-            reusable_policy=(policy in {strict_page_policy} if page_grounded_only else policy in {"COUPANG_PRODUCT_VISIBLE_GALLERY_THEN_DETAIL_V7_49","COUPANG_API_THEN_TOSS_API_PRODUCT_VISIBLE_V7_50","COUPANG_RECHECK_TOSS_GALLERY_DIAGNOSTIC_V7_51","THREE_MARKET_API_IMAGE_REPAIR_V7_55","PRODUCT_PAGE_GROUNDED_IMAGE_V7_62","PRODUCT_PAGE_GROUNDED_IMAGE_V7_71","IMAGE_BLOG_EDITOR_RECOVERY_V7_72","V8_04_REPRESENTATIVE_PLUS_TWO_PRODUCT_VISIBLE",strict_page_policy})
+            cached_paths=[str(im.get("path") or "") for im in old.get("images") or [] if isinstance(im,dict)]
+            reusable_policy=(policy==strict_page_policy and not image_evidence_error(old_ev,product["name"],cached_paths))
+            if not reusable_policy:prior_exact_product=False
             if reusable_policy and old.get("target")==product["name"] and prior_exact_product:
                 trusted_existing_reuse=True
                 prior=[]
@@ -2590,53 +2595,26 @@ def capture_images_cached(product,post_dir,con,repair_mode=False,progress=None):
                 if len(prior)>=want and bool(composition.get("verified")):
                     return prior[:want],str(old_ev)
         except Exception:pass
-    # DB-verified files survive both normal and repair runs. A temporary API
-    # miss or Coupang Access Denied must never turn an existing 3/3 into 0/3.
-    try:
-        db_verified=int(product["image_verified_count"] or 0)
-    except Exception:db_verified=0
-    if db_verified>0 and (not page_grounded_only or trusted_existing_reuse):
-        for index,key in enumerate(("image1","image2","image3")):
-            try:pth=product[key]
-            except Exception:pth=None
-            if pth and Path(pth).exists():
-                sp=str(Path(pth))
-                add_local_record(sp,"db_verified_v803_recheck","","",
-                                 "representative" if index==0 else "legacy_detail_or_gallery_revalidated",index>0)
-                if sp not in preserved_existing:preserved_existing.append(sp)
-        if preserved_existing:prior_exact_product=True
-    if old_ev.exists():
-        # Remove files from non-v7.49 evidence so old text-only crops cannot be
-        # silently reused. Verified v7.49 evidence above returns immediately when
-        # complete and keeps valid partial files through local_paths.
-        try:
-            old=json.loads(old_ev.read_text(encoding="utf-8"))
-            valid_reuse_policies=({strict_page_policy} if page_grounded_only else {"COUPANG_PRODUCT_VISIBLE_GALLERY_THEN_DETAIL_V7_49","COUPANG_API_THEN_TOSS_API_PRODUCT_VISIBLE_V7_50","COUPANG_RECHECK_TOSS_GALLERY_DIAGNOSTIC_V7_51","THREE_MARKET_API_IMAGE_REPAIR_V7_55","PRODUCT_PAGE_GROUNDED_IMAGE_V7_62","PRODUCT_PAGE_GROUNDED_IMAGE_V7_71","IMAGE_BLOG_EDITOR_RECOVERY_V7_72","V8_04_REPRESENTATIVE_PLUS_TWO_PRODUCT_VISIBLE",strict_page_policy})
-            if str(old.get("source_policy") or "") not in valid_reuse_policies:
-                prior_exact_product=False;local_records=[]
-                for im in old.get("images") or []:
-                    pth=Path(im.get("path") or "") if isinstance(im,dict) else None
-                    if pth and pth.exists() and pth.parent.resolve()==post_dir.resolve():
-                        pth.unlink(missing_ok=True)
-        except Exception:pass
-
+    if trusted_existing_reuse:
+        preserved_existing=[str(record["path"]) for record in local_records]
     # Existing verified Coupang price evidence can provide a local crop and an
     # already-known direct product URL, without any new search request.
     price_records=[];fallback_price_records=[]
     for pr in _price_evidence_records(product):
         if not pr.get("verified"):
             continue
+        identity_ok,_,_= _balanced_exact_product_accept(pr.get("product_name") or "",product["name"])
+        if not identity_ok:
+            rejected.append({"kind":"price_evidence","reason":"가격 근거의 원본 상품명 일치 미확인"})
+            continue
         if coupang_only and pr.get("site")!="쿠팡":
             if pr.get("site") in {"토스쇼핑","네이버쇼핑"}:fallback_price_records.append(pr)
             continue
         page_url=pr.get("url") or ""
         price_records.append(pr)
-        pth=pr.get("image_path")
-        if pth and Path(pth).exists():
-            add_local_record(pth,"verified_price_local",str(pr.get("site") or ""),page_url,"representative",False)
         iu=pr.get("image_url") or ""
         if iu and all(x.get("url")!=iu for x in sources):
-            sources.append({"url":iu,"platform":pr.get("site") or "","page_url":page_url,"kind":"price_evidence","match_score":pr.get("match") or 1.0})
+            sources.append({"url":iu,"platform":pr.get("site") or "","page_url":page_url,"kind":"price_evidence","candidate_name":pr.get("product_name") or "","match_score":pr.get("match") or 1.0})
 
     # Browser-free Coupang API is the primary network image source.
     stage("쿠팡 API 대표이미지/동일상품 확인")
@@ -2658,7 +2636,9 @@ def capture_images_cached(product,post_dir,con,repair_mode=False,progress=None):
                 if not iok:
                     rejected.append({"platform":"쿠팡","kind":"coupang_partners_api_search","candidate_name":m.get("name") or "","reason":"쿠팡 API 동일상품 검증 실패","match_detail":idetail})
                     continue
-                iu=m.get("image_url") or "";pu=m.get("url") or ""
+                iu=m.get("image_url") or "";pu=_coupang_api_product_url(str(m.get("url") or ""),str(m.get("product_id") or ""))
+                if not pu:
+                    rejected.append({"platform":"쿠팡","kind":"coupang_partners_api_search","candidate_name":name_text,"reason":"쿠팡 API 상품 URL·ID 연결 불일치 또는 없음"});continue
                 if pu and _is_direct_coupang_product_url(pu) and pu not in api_detail_urls:api_detail_urls.append(pu)
                 if iu and all(x.get("url")!=iu for x in api_sources):
                     api_sources.append({"url":iu,"platform":"쿠팡","page_url":pu,"kind":"coupang_partners_api_search","image_role":"representative","match_score":m.get("match") or 1.0,"product_id":m.get("product_id") or "","query_used":m.get("query_used") or "","candidate_name":m.get("name") or ""})
@@ -2671,27 +2651,10 @@ def capture_images_cached(product,post_dir,con,repair_mode=False,progress=None):
     # can be broadened, but every result title is revalidated against the untouched
     # original product name/model/capacity/count before any bytes are accepted.
     naver_image_state={"ready":naver_image_api.ready(),"queries":0,"matched":0,"errors":[],"endpoint":"NAVER_API_HUB_IMAGE"}
-    use_naver_shortage=bool(cfg.get("image_naver_api_shortage_fallback_enabled",True))
-    allow_naver_exact=bool(strict_naver_exact or not strict_cg_only)
-    if allow_naver_exact and (not coupang_only or use_naver_shortage) and cfg.get("naver_image_api_enabled",True) and naver_image_api.ready():
-        try:
-            maxq=max(1,int(cfg.get("naver_image_api_query_count",3)))
-            nmatches,nerrs,ndiag=naver_image_api.exact_matches_with_diagnostic(product["name"],max_queries=maxq,threshold=float(cfg.get("naver_image_match_threshold",0.72)))
-            naver_image_state.update({"queries":maxq,"matched":len(nmatches),"errors":nerrs[-8:],"diagnostic":ndiag,
-                                      "raw_seen":int(ndiag.get("raw_seen") or 0),"unique_seen":int(ndiag.get("unique_seen") or 0),
-                                      "identity_reject":int(ndiag.get("identity_reject") or 0),"model_reject":int(ndiag.get("model_reject") or 0),
-                                      "size_reject":int(ndiag.get("size_reject") or 0),"used":0,"download_failed":0})
-            maxcand=max(3,int(cfg.get("naver_image_api_max_candidates",12)))
-            for ni,m in enumerate(nmatches[:maxcand]):
-                iu=m.get("image_url") or m.get("thumbnail") or ""
-                if not iu or any(x.get("url")==iu for x in sources):continue
-                role="search_exact" if ni==0 else "gallery"
-                sources.append({"url":iu,"thumbnail":m.get("thumbnail") or "","platform":"네이버이미지API","page_url":"","kind":"naver_image_search_api",
-                                "image_role":role,"candidate_name":m.get("name") or "","match_score":m.get("match") or 0,
-                                "width":m.get("width"),"height":m.get("height"),"query_used":m.get("query_used") or "",
-                                "match_detail":m.get("match_detail") or {}})
-        except Exception as exc:
-            naver_image_state["errors"].append(str(exc));log("NAVER API HUB 이미지 exact 보강 실패: "+str(exc))
+    if naver_image_state["ready"] and cfg.get("naver_image_api_enabled",True):
+        naver_image_state["errors"]=["이미지 검색 API는 원본 상품 페이지를 제공하지 않아 사진 확정에서 제외합니다."]
+        rejected.append({"platform":"네이버이미지API","kind":"naver_image_search_api",
+                         "reason":"검색 결과 제목만으로 사진을 확정하지 않음: 원본 상품 페이지 연결 근거 없음"})
 
     # Same-run discovery thumbnails across all 3 sites require no new browser search.
     rows=_same_product_candidate_rows(con,product)
@@ -2872,6 +2835,8 @@ def capture_images_cached(product,post_dir,con,repair_mode=False,progress=None):
     def save_url(rec):
         """Save a title/gallery image. Detail content must use save_detail_url()."""
         if len(saved)>=want:return False
+        if not rec.get("page_url") or rec.get("kind")=="naver_image_search_api":
+            rejected.append({**rec,"reason":"검증된 원본 상품 페이지가 없는 사진 제외"});return False
         slot_class=role_class(rec.get("kind"),rec.get("image_role"),False)
         if not role_available(slot_class):
             rejected.append({**rec,"reason":"대표 1장 + 상세/갤러리 2장 역할 구성에 맞지 않는 URL 이미지"});return False
@@ -2933,18 +2898,8 @@ def capture_images_cached(product,post_dir,con,repair_mode=False,progress=None):
         if prior_exact_product and local_records:
             exact_product_found=True
         elif not bool(cfg.get("image_google_source_fallback_enabled",True)):
-            for key in ("image1","image2","image3"):
-                try:
-                    x=product[key]
-                    if x:
-                        xp=Path(x)
-                        if xp.exists() and xp.parent.resolve()==post_dir.resolve():xp.unlink(missing_ok=True)
-                except Exception:pass
-            for x in post_dir.glob("*.jpg"):
-                if x.name.startswith("_candidate_"):continue
-                x.unlink(missing_ok=True)
             failure=_image_failure_summary(0,want,resolver_state,toss_fallback,detail_sources,rejected,api_state,None,naver_image_state)
-            evidence={"target":product["name"],"required":want,"source_policy":strict_page_policy,
+            evidence={"target":product["name"],"required":want,"source_policy":strict_page_policy,"identity_verification":IDENTITY_POLICY,
                       "verified_count":0,"verified":False,"exact_product_found":False,"exact_coupang_found":False,
                       "composition":{"policy":"COUPANG_GOOGLE_EXACT_PRODUCT_TRIPLE_V8_08_43",
                                      "representative_count":0,"secondary_count":0,"ordered_roles":[],"verified":False},
@@ -2980,22 +2935,6 @@ def capture_images_cached(product,post_dir,con,repair_mode=False,progress=None):
     for rec in representative_sources:
         if len(saved)>=want or any(x.get("slot_class")=="representative" for x in saved):break
         save_url(rec)
-
-    # v8.08.48 FAST API-FIRST: consume exact NAVER Image API candidates before
-    # opening slow/fragile Coupang browser detail pages or Google. This was the
-    # ordering bug in v8.08.46/47: NAVER candidates were discovered here but the
-    # 2nd/3rd NAVER images were not tried until *after* Google had already run.
-    if len(saved)<want and strict_naver_exact:
-        stage(f"NAVER 이미지 API exact 우선 보강 · 후보 {naver_image_state.get('matched',0)}건")
-        for rec in [x for x in sources if str(x.get("kind") or "")=="naver_image_search_api"]:
-            if len(saved)>=want:break
-            rc=dict(rec)
-            rc["image_role"]="search_exact" if not any(x.get("slot_class")=="representative" for x in saved) else "gallery"
-            before=len(saved)
-            save_url(rc)
-            if len(saved)>before:naver_image_state["used"]=int(naver_image_state.get("used") or 0)+1
-            elif str((rejected[-1] if rejected else {}).get("kind") or "")=="naver_image_search_api":
-                naver_image_state["download_failed"]=int(naver_image_state.get("download_failed") or 0)+1
 
     # Crucial v7.38 behavior: make the direct product-page decision AFTER dHash
     # validation.  Three different URLs that are actually the same photo no
@@ -3385,19 +3324,9 @@ def capture_images_cached(product,post_dir,con,repair_mode=False,progress=None):
             or role in {"representative","title_gallery","search_exact"}
             or platform in {"쿠팡","토스쇼핑","네이버이미지API","네이버쇼핑"}
         )
-    # Final NAVER retry only for candidates not already saved. Normally the fast
-    # API-first pass above has already consumed these before browser fallbacks.
-    if len(saved)<want and strict_naver_exact:
-        used_urls={str(x.get("url") or "") for x in saved}
-        for rec in [x for x in sources if str(x.get("kind") or "")=="naver_image_search_api" and str(x.get("url") or "") not in used_urls]:
-            if len(saved)>=want:break
-            rc=dict(rec);rc["image_role"]="gallery" if any(x.get("slot_class")=="representative" for x in saved) else "search_exact"
-            before=len(saved);save_url(rc)
-            if len(saved)>before:naver_image_state["used"]=int(naver_image_state.get("used") or 0)+1
-
     if len(saved)<want:
         if strict_cg_only or page_grounded_only or not bool(cfg.get("image_strict_source_fallback_after_page_failure",False)):
-            rejected.append({"platform":"SYSTEM","kind":"generic_thumbnail_backfill_blocked","reason":"exact 쿠팡/NAVER 이미지/Google 검증 체인 외 일반 검색 썸네일로 부족분을 채우지 않음","saved_count":len(saved),"required":want})
+            rejected.append({"platform":"SYSTEM","kind":"generic_thumbnail_backfill_blocked","reason":"검증된 상품 페이지/API 외 검색 썸네일로 부족분을 채우지 않음","saved_count":len(saved),"required":want})
         else:
             strict_sources=[rec for rec in sources if _strict_source_backfill(rec)]
             relaxed_sources=[rec for rec in sources if rec not in strict_sources]
@@ -3420,7 +3349,7 @@ def capture_images_cached(product,post_dir,con,repair_mode=False,progress=None):
     physical=[x for x in saved if x.get("path") and Path(x["path"]).exists()]
     representative_count=sum(1 for x in physical if x.get("slot_class")=="representative")
     secondary_count=sum(1 for x in physical if x.get("slot_class")=="secondary")
-    composition={"policy":"COUPANG_NAVER_IMAGE_GOOGLE_EXACT_PRODUCT_TRIPLE_V8_08_48",
+    composition={"policy":"PRIMARY_PAGE_OR_EXACT_API_V1",
                  "representative_count":representative_count,"secondary_count":secondary_count,
                  "ordered_roles":[x.get("slot_class") for x in physical[:want]],
                  "verified":bool(len(physical)>=want and representative_count==1 and secondary_count>=2 and
@@ -3433,7 +3362,7 @@ def capture_images_cached(product,post_dir,con,repair_mode=False,progress=None):
     if len(physical)>=want and not composition["verified"]:
         failure={**failure,"code":"IMAGE_ROLE_COMPOSITION_FAILED",
                  "short":"대표 1장 + 제품이 보이는 상세/갤러리 2장 역할 구성 미충족"}
-    evidence={"target":product["name"],"required":want,"source_policy":strict_page_policy,
+    evidence={"target":product["name"],"required":want,"source_policy":strict_page_policy,"identity_verification":IDENTITY_POLICY,
               "verified_count":len(physical),"verified":bool(composition["verified"]),"composition":composition,
               "exact_product_found":exact_product_found,"exact_coupang_found":exact_coupang_final,
               "preserved_existing_count":len(preserved_existing),
@@ -3487,12 +3416,14 @@ def capture_product_images(product_id,progress=None):
         content_ready=bool(r["title"] and r["body"] and r["tags"])
         exact=_evidence_exact_found(ep)
         st=(f'사진보강대기 {len(images)}/{want}' if not exact else ('사진3장완료' if content_ready and complete else ('사진3장검증' if complete else f'사진보강대기 {len(images)}/{want}')))
+        if is_wala_product(r) and not exact:st=f"왈라랜드 사진확인대기 {len(images)}/{want}"
         con.execute("""UPDATE products SET image1=?,image2=?,image3=?,image_verified_count=?,image_evidence_json=?,
                        status=?,post_dir=?,updated_at=datetime('now','localtime') WHERE id=?""",
                     (vals[0],vals[1],vals[2],len(images),ep,st,str(pdir),r["id"]))
         con.commit();_sync_post_images(pdir,images)
         if progress:progress(1,1,f"실제 제품 이미지 {len(images)}/3 검증")
-        return {"product_id":r["id"],"images":images,"verified_count":len(images),"evidence":ep}
+        return {"product_id":r["id"],"images":images,"verified_count":len(images),"evidence":ep,
+                "skipped":is_wala_product(r),"reason":REVIEW_REASON if is_wala_product(r) else ""}
     finally:con.close()
 
 
@@ -3521,6 +3452,7 @@ def _local_product_keyword_recovery(product_name, category="", max_count=12):
 
 def _content_needs_generation(row,cfg=None):
     """Only new, incomplete or explicitly failed articles enter Stage ②."""
+    if is_wala_product(row):return False,"왈라랜드 원고 보존 · 재작성은 착장 페이지에서 실행"
     cfg=cfg or settings();status=str(row["status"] or "")
     title=str(row["title"] or "").strip();body=str(row["body"] or "").strip();tags=str(row["tags"] or "").strip()
     if not (title and body and tags):return True,"신규/원고필드누락"
@@ -3561,9 +3493,15 @@ def run_text(context=None,progress=None):
     pending=[];preserved=[]
     for row in all_rows:
         need,reason=_content_needs_generation(row,cfg)
-        if force or need:pending.append(row)
+        if (force and not is_wala_product(row)) or need:pending.append(row)
         else:preserved.append({"id":row["id"],"product_no":row["product_no"],"name":row["name"],"reason":reason})
     rows=pending
+    if not rows:
+        con.close()
+        return {"processed":0,"eligible":0,"preserved_complete":len(preserved),"preserved_rows":preserved,
+                "failed":[],"naver_keyword_empty":[],"keyword_recovered":[],"sharelink_pending":[],"fallback_used":[],
+                "diagnostic_csv":"","llm_runtime":{},"stage_ok":True,"soft_pending":False,"cancelled":False,
+                "message":f"기존 원고 보존 {len(preserved)}건 · 생성 대상 없음"}
     prog=ProgressThrottle(progress);done=0;seo_short=[];failed=[];fallback_used=[];keyword_recovered=[];diagnostics=[]
     history=_load_content_history();div_retry=max(1,int(cfg.get("content_diversity_retry_count",3)))
     ref_profile=reference_blog_style.get_reference_profile(False);ref_hint=reference_blog_style.prompt_hint(ref_profile)
@@ -3805,6 +3743,8 @@ def run_images(context=None,progress=None):
     want=int(cfg.get("image_exact_count",3))
     repair_only=bool((context or {}).get("repair_only")) if isinstance(context,dict) else False
     force_recollect=bool((context or {}).get("force_recollect")) if isinstance(context,dict) else False
+    stop_check=(context or {}).get("stop_check") if isinstance(context,dict) else None
+    stopped=False
     already_complete=0
     if repair_only:
         rows=con.execute("""SELECT * FROM products
@@ -3826,6 +3766,9 @@ def run_images(context=None,progress=None):
     try:
         with StageTimer("동일상품 사진 전체(직링크 저속 크롭)",f"products={len(rows)}"):
             for r in rows:
+                if callable(stop_check) and stop_check():
+                    stopped=True
+                    break
                 prog(done,len(rows),f"{'사진보강 API 재탐색' if repair_only else '동일상품 사진 3장'}: {r['name'][:38]}")
                 try:
                     pdir=Path(r["post_dir"]) if r["post_dir"] else POSTS/f"{int(r['product_no'] or r['id']):02d}_{re.sub(r'[^가-힣A-Za-z0-9_-]','_',r['name'])[:40]}"
@@ -3897,7 +3840,7 @@ def run_images(context=None,progress=None):
         try:
             OUTPUTS.mkdir(parents=True,exist_ok=True)
             dp=OUTPUTS/("image_repair_diagnostic.csv" if repair_only else "image_collect_diagnostic.csv")
-            fields=["TOP","상품명","사진수","완료","원인코드","원인","쿠팡검색","쿠팡API후보수","쿠팡유사후보","쿠팡상세","Google시도","Google후보수","Google통과후보","Google검증페이지","토스검색","토스API후보수","토스유사후보","토스상세","이미지1출처","이미지1페이지","이미지2출처","이미지2페이지","이미지3출처","이미지3페이지","evidence"]
+            fields=["TOP","상품명","사진수","완료","원인코드","원인","쿠팡검색","쿠팡API후보수","쿠팡유사후보","쿠팡상세","NAVER준비","NAVER검색원본","NAVER동일제품후보","NAVER실사용","NAVER오류","Google시도","Google후보수","Google통과후보","Google검증페이지","토스검색","토스API후보수","토스유사후보","토스상세","이미지1출처","이미지1페이지","이미지2출처","이미지2페이지","이미지3출처","이미지3페이지","evidence"]
             with dp.open("w",encoding="utf-8-sig",newline="") as f:
                 w=csv.DictWriter(f,fieldnames=fields);w.writeheader();w.writerows(diag_rows)
         except Exception as e:log("이미지 진단 CSV 저장 실패: "+str(e))
@@ -3906,8 +3849,9 @@ def run_images(context=None,progress=None):
         if excluded:msg+=f" · 기존 제외상태 복구대상 {len(excluded)}건"
         if short:msg+=f" · 사진보강 {len(short)}건"
         if failed:msg+=f" · 개별오류 {len(failed)}건(나머지 계속 처리)"
+        if stopped:msg+=" · 사용자 중지, 처리한 사진은 보존"
         prog(done,max(1,done),msg,force=True)
-        return {"processed":done,"complete":complete,"already_complete":already_complete,"excluded":excluded,"shortages":short,"failed":failed,"stage_ok":not short and not failed,"soft_pending":bool(short or failed),"message":msg}
+        return {"processed":done,"complete":complete,"already_complete":already_complete,"excluded":excluded,"shortages":short,"failed":failed,"stopped":stopped,"stage_ok":not short and not failed and not stopped,"soft_pending":bool(short or failed or stopped),"message":msg}
     finally:con.close()
 
 

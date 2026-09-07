@@ -9,6 +9,10 @@ collected discovery snapshots or a user-triggered browser refresh.
 from pathlib import Path
 import os, json, time, hmac, hashlib, urllib.parse, urllib.request, urllib.error, threading, html, io
 from datetime import datetime, timezone
+from collections.abc import Callable
+
+from .affiliate_identity import product_id as _identity_product_id, same_product_url, variant_conflicts
+from .affiliate_request import AffiliateStopped, AffiliateTimeout, Operation, fetch
 
 from .common import (ROOT, DATA, log, db_connect, init_db_fast,
                      marketplace_product_accept, critical_identity_tokens,
@@ -165,16 +169,21 @@ def _cache_put(key,value):
         CACHE.write_text(json.dumps(obj,ensure_ascii=False,indent=2),encoding="utf-8")
 
 
-def _throttle():
+def _throttle(operation: Operation | None = None):
     global _LAST_CALL
     sec=float(_settings().get("coupang_api_min_interval_sec",0.45))
-    with _LOCK:
+    operation=operation or Operation(time.monotonic()+30)
+    while not _LOCK.acquire(timeout=0.1):
+        operation.remaining()
+    try:
         wait=max(0.0,sec-(time.monotonic()-_LAST_CALL))
-        if wait:time.sleep(wait)
+        if wait:operation.pause(wait)
         _LAST_CALL=time.monotonic()
+    finally:
+        _LOCK.release()
 
 
-def search(keyword, limit=10, use_cache=True):
+def search(keyword, limit=10, use_cache=True, operation: Operation | None = None):
     """Return normalized Coupang Partners product search rows.
 
     Search itself is browser-free.  The API account/rate policy still applies,
@@ -184,6 +193,8 @@ def search(keyword, limit=10, use_cache=True):
     if not keyword:return []
     limit=max(1,min(10,int(limit)))
     cfg=_settings();ttl=int(cfg.get("coupang_api_cache_ttl_sec",300))
+    operation=operation or Operation(time.monotonic()+max(1,min(30,float(cfg.get("coupang_api_timeout_sec",15)))))
+    operation.remaining()
     ck=_cache_key(keyword,limit)
     if use_cache:
         hit=_cache_get(ck,ttl)
@@ -200,11 +211,12 @@ def search(keyword, limit=10, use_cache=True):
         uri=path+"?"+params
         auth=_authorization("GET",uri,access,secret)
         req=urllib.request.Request(BASE_URL+uri,headers={"Authorization":auth,"Content-Type":"application/json;charset=UTF-8","Accept":"application/json"})
-        _throttle()
+        _throttle(operation)
         try:
-            with urllib.request.urlopen(req,timeout=float(cfg.get("coupang_api_timeout_sec",15))) as r:
-                body=r.read(2*1024*1024).decode("utf-8","replace");used_path=path
+            body=fetch(req,operation).decode("utf-8","replace");used_path=path
             break
+        except (AffiliateStopped, AffiliateTimeout):
+            raise
         except urllib.error.HTTPError as e:
             detail=e.read(8000).decode("utf-8","replace") if hasattr(e,"read") else str(e)
             last_error=RuntimeError(f"쿠팡 Partners API HTTP {e.code}: {detail[:500]}")
@@ -311,6 +323,8 @@ def _sharelink_candidate_accept(candidate_name, target_name):
     """
     threshold=float(_settings().get("coupang_sharelink_match_threshold",0.36))
     ok,score,detail=marketplace_product_accept(candidate_name,target_name,threshold)
+    conflicts=variant_conflicts(str(candidate_name or ""),str(target_name or ""))
+    if conflicts:return False,score,{**detail,"variant_conflicts":conflicts,"sharelink_match_mode":"variant_rejected"}
     if ok:return ok,score,{**detail,"sharelink_match_mode":detail.get("match_mode") or "balanced"}
     low=" ".join(str(candidate_name or "").lower().split())
     terms=identity_terms(target_name)[:8];hits=[x for x in terms if x.lower() in low]
@@ -322,13 +336,17 @@ def _sharelink_candidate_accept(candidate_name, target_name):
                           "required_hits":required,"sharelink_match_mode":"core_keyword_full_title_verified" if relaxed else "rejected"}
 
 
-def sharelink_exact_matches(target_name, max_queries=7):
+def sharelink_exact_matches(target_name, max_queries=7, operation: Operation | None = None):
     """Search broad, validate strict, and retain per-query failure evidence."""
     matched=[];seen=set();errors=[];attempts=[]
+    operation=operation or Operation(time.monotonic()+45)
     for q in sharelink_query_variants(target_name,max_queries):
-        try:rows=search(q,10)
+        operation.remaining()
+        try:rows=search(q,10,operation=operation)
+        except (AffiliateStopped, AffiliateTimeout):
+            raise
         except Exception as e:
-            errors.append(str(e));attempts.append({"query":q,"error":str(e),"result_count":0});continue
+            errors.append(str(e));attempts.append({"query":q,"error":str(e),"result_count":0});break
         accepted=0;rejected=[]
         for row in rows:
             key=row.get("product_id") or (row.get("name"),row.get("price"),row.get("url"))
@@ -341,6 +359,7 @@ def sharelink_exact_matches(target_name, max_queries=7):
             item=dict(row);item.update(match=score,match_detail=detail,verified=True,query_used=q)
             matched.append(item);accepted+=1
         attempts.append({"query":q,"result_count":len(rows),"accepted":accepted,"rejected_samples":rejected})
+        if matched:break
     matched.sort(key=lambda r:(-float(r.get("match") or 0),int(r.get("rank") or 9999),int(r.get("price") or 10**12)))
     return matched,errors,attempts
 
@@ -374,12 +393,7 @@ def best_exact_match(target_name, max_queries=2, threshold=None):
 
 
 def _product_id_from_url(url):
-    import re
-    try:
-        path=urllib.parse.urlsplit(str(url or "")).path or ""
-    except Exception:return ""
-    match=re.search(r"/(?:vp/)?products/(\d+)",path,re.I)
-    return match.group(1) if match else ""
+    return _identity_product_id(str(url or ""))
 
 
 def _valid_affiliate_url(url):
@@ -387,11 +401,11 @@ def _valid_affiliate_url(url):
     try:
         parsed=urllib.parse.urlsplit(str(url or "").strip())
         host=(parsed.hostname or "").lower()
-        return parsed.scheme.lower()=="https" and host in {"link.coupang.com","coupa.ng"} and bool(parsed.path.strip("/"))
+        return parsed.scheme.lower()=="https" and host in {"link.coupang.com","coupa.ng"} and parsed.username is None and parsed.port in (None,443) and bool(parsed.path.strip("/"))
     except Exception:return False
 
 
-def _cached_deeplink(product_id,sub_id=""):
+def _cached_deeplink(product_id,sub_id="",source_url="",product_name=""):
     if not str(product_id or "").strip():return None
     init_db_fast();con=db_connect(row_factory=True)
     try:
@@ -401,12 +415,19 @@ def _cached_deeplink(product_id,sub_id=""):
         if not row:return None
         link=str(row["sharelink"] or "").strip()
         if not _valid_affiliate_url(link):return None
+        if source_url and not same_product_url(source_url,str(row["source_url"] or "")):return None
+        if product_name:
+            accepted,_,_=_sharelink_candidate_accept(str(row["product_name"] or ""),str(product_name))
+            if not accepted:return None
+        meta={}
+        try:meta=json.loads(row["metadata_json"] or "{}")
+        except (ValueError,TypeError):return None
+        if meta.get("source") not in {"coupang_partners_deeplink","coupang_partners_search_affiliate_url"}:return None
+        if str(meta.get("product_id") or "")!=str(product_id):return None
+        if _product_id_from_url(row["source_url"] or "") and not same_product_url(row["source_url"],str(meta.get("original_url") or "")):return None
         con.execute("""UPDATE affiliate_link_cache SET last_used_at=datetime('now','localtime')
                        WHERE coupang_product_id=? AND sub_id=?""",
                     (str(product_id).strip(),str(sub_id or "").strip()));con.commit()
-        meta={}
-        try:meta=json.loads(row["metadata_json"] or "{}")
-        except Exception:meta={}
         return {"ok":True,"sharelink":link,"shorten_url":link,
                 "landing_url":"","original_url":row["source_url"] or "",
                 "product_id":str(product_id),"source":"affiliate_link_db_cache",
@@ -435,16 +456,12 @@ def _store_deeplink(product_id,sub_id,product_name,source_url,result,response_co
 
 
 def remember_existing_deeplink(product_id,sharelink,source_url="",product_name="",sub_id=""):
-    """Seed the permanent cache from a previously generated, locally valid link."""
-    if not _valid_affiliate_url(sharelink):return False
-    return _store_deeplink(product_id,sub_id,product_name,source_url,
-                           {"ok":True,"sharelink":str(sharelink).strip(),
-                            "shorten_url":str(sharelink).strip(),"landing_url":"",
-                            "original_url":str(source_url or ""),"source":"existing_verified_db_link"},
-                           "EXISTING")
+    """Recognize an existing link only through matching API cache evidence."""
+    cached=_cached_deeplink(product_id,sub_id,source_url,product_name)
+    return bool(cached and cached.get("sharelink")==str(sharelink or "").strip())
 
 
-def create_deeplink(coupang_url, sub_id="", use_cache=True, product_id="", product_name=""):
+def create_deeplink(coupang_url, sub_id="", use_cache=True, product_id="", product_name="", operation: Operation | None = None):
     """Create one affiliate link through the API, then reuse it forever by product ID.
 
     The returned tracking URL is never opened by urllib, Selenium, Chrome or any
@@ -452,13 +469,16 @@ def create_deeplink(coupang_url, sub_id="", use_cache=True, product_id="", produ
     checked locally.
     """
     url=str(coupang_url or "").strip()
-    if not url or "coupang.com/" not in url:
+    url_product_id=_product_id_from_url(url)
+    if not url_product_id:
         return {"ok":False,"reason":"쿠팡 상품 URL 없음","original_url":url}
     cfg=_settings();product_id=str(product_id or _product_id_from_url(url)).strip()
-    if not product_id:
-        return {"ok":False,"reason":"쿠팡 상품 ID를 확인할 수 없어 제휴링크 생성을 중단함","original_url":url}
+    if product_id!=url_product_id:
+        return {"ok":False,"reason":"쿠팡 상품 URL과 상품 ID 불일치","original_url":url}
+    operation=operation or Operation(time.monotonic()+max(1,min(30,float(cfg.get("coupang_api_timeout_sec",15)))))
+    operation.remaining()
     if use_cache:
-        cached=_cached_deeplink(product_id,sub_id)
+        cached=_cached_deeplink(product_id,sub_id,url,product_name)
         if cached:return cached
     access,secret=credentials()
     if not (access and secret):
@@ -469,10 +489,11 @@ def create_deeplink(coupang_url, sub_id="", use_cache=True, product_id="", produ
     auth=_authorization("POST",DEEPLINK_PATH,access,secret)
     req=urllib.request.Request(BASE_URL+DEEPLINK_PATH,data=raw,method="POST",headers={
         "Authorization":auth,"Content-Type":"application/json;charset=UTF-8","Accept":"application/json"})
-    _throttle()
+    _throttle(operation)
     try:
-        with urllib.request.urlopen(req,timeout=float(cfg.get("coupang_api_timeout_sec",15))) as r:
-            obj=json.loads(r.read(1024*1024).decode("utf-8","replace"))
+        obj=json.loads(fetch(req,operation).decode("utf-8","replace"))
+    except (AffiliateStopped, AffiliateTimeout):
+        raise
     except urllib.error.HTTPError as e:
         detail=e.read(8000).decode("utf-8","replace") if hasattr(e,"read") else str(e)
         return {"ok":False,"reason":f"쿠팡 딥링크 HTTP {e.code}: {detail[:400]}","original_url":url}
@@ -482,7 +503,10 @@ def create_deeplink(coupang_url, sub_id="", use_cache=True, product_id="", produ
     if response_code not in ("0","SUCCESS","200",""):
         return {"ok":False,"reason":"쿠팡 딥링크 API 오류: "+str(obj.get("rMessage") or obj.get("message") or obj)[:400],"original_url":url}
     rows=obj.get("data") or []
-    item=rows[0] if isinstance(rows,list) and rows and isinstance(rows[0],dict) else {}
+    item=next((row for row in rows if isinstance(row,dict) and
+               same_product_url(url,str(row.get("originalUrl") or ""))),{}) if isinstance(rows,list) else {}
+    if not item:
+        return {"ok":False,"reason":"딥링크 응답 원상품 URL 불일치 또는 누락","original_url":url}
     short=str(item.get("shortenUrl") or item.get("shortUrl") or "").strip()
     landing=str(item.get("landingUrl") or "").strip()
     # A plain landing URL is not accepted as the canonical affiliate link. The
@@ -493,11 +517,13 @@ def create_deeplink(coupang_url, sub_id="", use_cache=True, product_id="", produ
             "response_code":response_code,"source":"coupang_partners_deeplink",
             "cache_hit":False,"link_validation":"LOCAL_FORMAT_ONLY_NO_CLICK"}
     if not result["ok"]:result["reason"]="쿠팡 딥링크 응답에 유효한 HTTPS 단축 제휴링크가 없음"
-    else:_store_deeplink(product_id,sub_id,product_name,url,result,response_code)
+    else:
+        operation.remaining()
+        _store_deeplink(product_id,sub_id,product_name,url,result,response_code)
     return result
 
 
-def exact_product_sharelink(target_name, sub_id="", max_queries=3, verified_product_url=""):
+def exact_product_sharelink(target_name, sub_id="", max_queries=3, verified_product_url="", stop_check: Callable[[], bool] | None = None):
     """Reuse an already verified Coupang product URL, otherwise search the API.
 
     A TOP100 row discovered on Coupang already has stronger identity evidence
@@ -506,6 +532,8 @@ def exact_product_sharelink(target_name, sub_id="", max_queries=3, verified_prod
     still falls through to the cleaned core-keyword API search.
     """
     clean_target=clean_listing_title_noise(target_name) or str(target_name or "").strip()
+    operation=Operation(time.monotonic()+45,stop_check)
+    operation.remaining()
     direct_error=""
     verified=str(verified_product_url or "").strip()
     if verified:
@@ -514,32 +542,29 @@ def exact_product_sharelink(target_name, sub_id="", max_queries=3, verified_prod
             if parsed.scheme.lower()=="http" and (host.endswith("coupang.com") or "link.coupang.com" in host):
                 verified=urllib.parse.urlunsplit(("https",parsed.netloc,parsed.path,parsed.query,parsed.fragment))
                 parsed=urllib.parse.urlsplit(verified);host=(parsed.netloc or "").lower();path=(parsed.path or "").lower()
-            is_affiliate=("link.coupang.com" in host or "coupa.ng" in host)
-            is_product=host.endswith("coupang.com") and ("/vp/products/" in path or "/products/" in path)
-            if is_affiliate and _valid_affiliate_url(verified):
-                return {"ok":True,"sharelink":verified,"shorten_url":verified,"landing_url":"","original_url":verified,
-                        "source":"verified_coupang_affiliate_url","target_name_original":str(target_name or ""),
-                        "target_name_cleaned":clean_target,"query_attempts":[],
-                        "link_validation":"LOCAL_FORMAT_ONLY_NO_CLICK"}
+            is_product=bool(_product_id_from_url(verified))
             if is_product:
                 direct=create_deeplink(verified,sub_id=sub_id,
-                                       product_id=_product_id_from_url(verified),product_name=clean_target)
+                                       product_id=_product_id_from_url(verified),product_name=clean_target,operation=operation)
                 if direct.get("ok"):
                     return {**direct,"source":"verified_coupang_product_url_deeplink",
                             "target_name_original":str(target_name or ""),"target_name_cleaned":clean_target,
                             "query_attempts":[]}
                 direct_error=str(direct.get("reason") or "검증된 쿠팡 URL 딥링크 변환 실패")
+        except (AffiliateStopped, AffiliateTimeout):
+            raise
         except Exception as exc:
             direct_error="검증된 쿠팡 URL 처리 실패: "+str(exc)
-    rows,errors,attempts=sharelink_exact_matches(clean_target,max_queries=max_queries)
+    rows,errors,attempts=sharelink_exact_matches(clean_target,max_queries=max_queries,operation=operation)
     if direct_error:errors.insert(0,direct_error)
     match=rows[0] if rows else None
     if not match:
-        return {"ok":False,"reason":"쿠팡 Partners 동일상품 미검색","errors":errors[-4:],"query_attempts":attempts}
+        reason="쿠팡 Partners 동일상품 미검색"+(" · "+errors[-1] if errors else "")
+        return {"ok":False,"reason":reason,"errors":errors[-4:],"query_attempts":attempts}
     product_url=str(match.get("url") or "").strip()
     if not product_url:
         return {"ok":False,"reason":"쿠팡 Partners 동일상품 URL 없음","match":match,"errors":errors[-4:],"query_attempts":attempts}
-    dl=create_deeplink(product_url,sub_id=sub_id,product_id=match.get("product_id") or "",product_name=match.get("name") or clean_target)
+    dl=create_deeplink(product_url,sub_id=sub_id,product_id=match.get("product_id") or "",product_name=match.get("name") or clean_target,operation=operation)
     # Product-search responses can themselves contain an affiliate tracking URL.
     # If the deeplink endpoint temporarily fails, keep that verified Partners URL
     # rather than dropping the top Sharelink altogether.
@@ -547,6 +572,7 @@ def exact_product_sharelink(target_name, sub_id="", max_queries=3, verified_prod
         dl={"ok":True,"sharelink":product_url,"shorten_url":product_url,"landing_url":"","original_url":product_url,
             "source":"coupang_partners_search_affiliate_url","deeplink_fallback_reason":dl.get("reason") or "",
             "product_id":str(match.get("product_id") or ""),"link_validation":"LOCAL_FORMAT_ONLY_NO_CLICK"}
+        operation.remaining()
         _store_deeplink(match.get("product_id") or "",sub_id,match.get("name") or clean_target,
                         match.get("url") or "",dl,"SEARCH_RESPONSE")
     out={**dl,"match_product_name":match.get("name") or "","product_id":match.get("product_id") or "",

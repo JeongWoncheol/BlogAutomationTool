@@ -406,6 +406,7 @@ def disclosure_count(blocks):
 
 def verified_blog_image_set(row, required=3):
     """Validate both physical files and the v8.04 1+2 role composition."""
+    from .image_identity import image_evidence_error
     physical=[]
     for key in ("image1","image2","image3")[:int(required)]:
         try:value=str(row[key] or "").strip()
@@ -423,10 +424,16 @@ def verified_blog_image_set(row, required=3):
     composition_ok=bool(isinstance(composition,dict) and composition.get("verified") and
                         int(composition.get("representative_count") or 0)==1 and
                         int(composition.get("secondary_count") or 0)>=2)
-    ok=(len(physical)>=int(required) and count>=int(required) and composition_ok)
+    wala=("content_type" in row.keys() and "source_platform" in row.keys() and
+          row["content_type"]=="celebrity_style" and row["source_platform"]=="왈라랜드")
+    identity_error="" if wala else image_evidence_error(Path(evidence_path),str(row["name"] or ""),physical)
+    if len(set(str(Path(path).resolve()) for path in physical))!=len(physical):
+        identity_error="같은 사진 파일이 여러 슬롯에 중복되어 있습니다."
+    ok=(len(physical)>=int(required) and count>=int(required) and composition_ok and not identity_error)
     if len(physical)<int(required):reason=f"제품 이미지 실파일 {len(physical)}/{required}"
     elif count<int(required):reason=f"검증 이미지 메타데이터 {count}/{required}"
     elif not composition_ok:reason="대표 1장 + 제품 상세/갤러리 2장 구성 미검증"
+    elif identity_error:reason=identity_error
     else:reason=""
     return ok,{"physical_count":len(physical),"verified_count":count,
                "composition":composition or {},"reason":reason,"evidence_path":evidence_path}
