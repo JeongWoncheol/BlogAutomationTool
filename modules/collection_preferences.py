@@ -4,14 +4,17 @@ import os
 from pathlib import Path
 import tempfile
 from threading import RLock
+from typing import Final
 
-from pydantic import BaseModel, ConfigDict, JsonValue, ValidationInfo, field_validator
+from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter, ValidationInfo, field_validator
 
 from .common import DATA, settings
 
 MARKET_CATEGORIES = ("생활용품", "주방용품", "패션잡화", "식품", "디지털/가전", "화장품/미용")
 TREND_CATEGORIES = ("패션의류", "패션잡화", "화장품/미용", "디지털/가전", "가구/인테리어", "식품")
-AGE_GROUPS = {"20~30대": ("20", "30"), "40~60대": ("40", "50", "60")}
+AGE_GROUPS: Final = {f"{age}대": (str(age),) for age in range(10, 70, 10)}
+_LEGACY_AGE_GROUPS: Final = {"20~30대": ("20", "30"), "40~60대": ("40", "50", "60")}
+_AGE_MAPPING: Final = TypeAdapter(dict[str, tuple[str, ...]])
 type SettingsSnapshot = dict[str, JsonValue]
 _SAVE_LOCK = RLock()
 
@@ -36,18 +39,16 @@ class CollectionPreferences(BaseModel):
 
 def load_preferences(cfg: Mapping[str, JsonValue] | None = None) -> CollectionPreferences:
     source = settings() if cfg is None else cfg
-    ages = source.get("trend_age_groups", AGE_GROUPS)
-    if not isinstance(ages, dict):
-        message = "trend_age_groups는 연령그룹과 연령코드의 매핑이어야 합니다."
-        raise ValueError(message)
+    ages = _AGE_MAPPING.validate_python(source.get("trend_age_groups", AGE_GROUPS))
+    supported = {**AGE_GROUPS, **_LEGACY_AGE_GROUPS}
     for label, codes in ages.items():
-        if label not in AGE_GROUPS or not isinstance(codes,(list,tuple)) or tuple(codes) != AGE_GROUPS[label]:
+        if label not in supported or codes != supported[label]:
             message = f"지원하지 않는 연령그룹 또는 연령코드입니다: {label}"
             raise ValueError(message)
     return CollectionPreferences.model_validate({
         "market_categories": source.get("categories", MARKET_CATEGORIES),
         "trend_categories": source.get("trend_categories", TREND_CATEGORIES),
-        "age_groups": tuple(ages),
+        "age_groups": tuple(dict.fromkeys(f"{code}대" for label in ages for code in supported[label])),
     })
 
 

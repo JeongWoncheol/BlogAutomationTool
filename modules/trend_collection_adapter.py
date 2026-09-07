@@ -14,7 +14,7 @@ from . import chrome_collector
 from .collection_preferences import CollectionPreferences, load_preferences, apply_preferences, AGE_GROUPS
 
 DEFAULT_CATEGORIES=["패션의류","패션잡화","화장품/미용","디지털/가전","가구/인테리어","식품"]
-DEFAULT_AGE_GROUPS={"20~30대":["20","30"],"40~60대":["40","50","60"]}
+DEFAULT_AGE_GROUPS={label:list(codes) for label,codes in AGE_GROUPS.items()}
 SOURCE_ITEMSCOUT="아이템스카우트"
 SOURCE_DATALAB="네이버데이터랩"
 
@@ -43,7 +43,7 @@ def _tasks(source,cfg):
     if source==SOURCE_ITEMSCOUT:
         # v8.00: the reference screenshots use keyword type "전체" with
         # "주요 브랜드 제외" enabled.  Category URLs are deterministic, so use
-        # them directly and collect both age ranges before moving categories.
+        # them directly and collect each selected decade before moving categories.
         keyword_type=str(cfg.get("itemscout_keyword_type") or "전체")
         exclude_major=bool(cfg.get("itemscout_exclude_major_brands",True))
     elif source==SOURCE_DATALAB:
@@ -51,7 +51,7 @@ def _tasks(source,cfg):
     else:
         raise ValueError("지원하지 않는 트렌드 수집처: "+str(source))
     tasks=[];meta={}
-    # Category outer-loop => ItemScout page load only six times, not twelve.
+    # Category outer-loop lets all selected decades reuse the category page.
     for ci,category in enumerate(categories,1):
         for gi,(age_label,age_codes) in enumerate(age_groups,1):
             tid=f"trend-{('itemscout' if source==SOURCE_ITEMSCOUT else 'datalab')}-{ci:02d}-{gi:02d}"
@@ -103,7 +103,7 @@ def merged_rows(source, preferences: CollectionPreferences | None = None):
     """Return display/export rows with duplicate keywords merged per category.
 
     Raw age-bucket rows remain in trend_candidates as evidence.  The GUI/CSV
-    shows one row when the same item appears in both age groups and preserves
+    shows one row when the same item appears in multiple decades and preserves
     the per-age ranks inside the merged status/evidence summary.
     """
     selection=load_preferences() if preferences is None else preferences
@@ -131,6 +131,7 @@ def merged_rows(source, preferences: CollectionPreferences | None = None):
     out=[]
     for g in groups.values():
         g["age_groups"].sort(key=lambda x:age_order.get(x,99))
+        g["age_codes"]=[code for label,codes in AGE_GROUPS.items() if label in g["age_groups"] for code in codes]
         rank=min(g["ranks"].values()) if g["ranks"] else 999
         both=len(g["age_groups"])>1
         out.append({"source":g["source"],"age_group":" / ".join(g["age_groups"]),"age_codes":",".join(g["age_codes"]),
@@ -150,7 +151,7 @@ def _write_exports(source, preferences: CollectionPreferences):
     with (outdir/f"{stem}.csv").open("w",newline="",encoding="utf-8-sig") as f:
         w=csv.writer(f);w.writerow(["수집처","연령그룹","연령코드","카테고리","통합순위","키워드","연령별순위","수집시각","페이지URL","상태"])
         for r in merged:w.writerow([r["source"],r["age_group"],r["age_codes"],r["category"],r["rank_no"],r["keyword"],r["age_rank"],r["captured_at"],r["page_url"],r["status"]])
-    # Keep the raw 20~30 / 40~60 evidence separately for diagnosis.
+    # Export selected raw decade evidence; legacy combined rows stay in the DB.
     con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
     try:raw=con.execute("""SELECT source,age_group,age_codes,category,rank_no,keyword,captured_at,page_url,status,evidence_json
                             FROM trend_candidates WHERE source=? ORDER BY category,age_group,rank_no,id""",(source,)).fetchall()

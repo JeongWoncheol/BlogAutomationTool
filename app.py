@@ -391,7 +391,8 @@ class App(tk.Tk):
           ("trend","트렌드 카테고리",collection_preferences.TREND_CATEGORIES,prefs.trend_categories),
           ("age","트렌드 연령대",tuple(collection_preferences.AGE_GROUPS),prefs.age_groups))
   for key,title,choices,selected in groups:
-   card=self._card(p,title,"선택한 항목만 다음 수집과 상품 연결에 반영됩니다.");card.pack(fill="x",pady=(0,12))
+   subtitle="10대부터 60대까지 개별 선택합니다. 선택한 연령대별로 따로 수집하며, 중간 연령대를 자동으로 추가하지 않습니다." if key=="age" else "선택한 항목만 다음 수집과 상품 연결에 반영됩니다."
+   card=self._card(p,title,subtitle);card.pack(fill="x",pady=(0,12))
    row=ttk.Frame(card,padding=14);row.pack(fill="x")
    for col in range(3):row.columnconfigure(col,weight=1)
    variables={name:tk.BooleanVar(value=name in selected) for name in choices};self.collection_selection_vars[key]=variables
@@ -412,7 +413,8 @@ class App(tk.Tk):
 
  def update_collection_selection_summary(self) -> None:
   counts={key:sum(var.get() for var in values.values()) for key,values in self.collection_selection_vars.items()}
-  self.collection_selection_summary.set(f"3사 {counts['market']}개 카테고리 · 트렌드 {counts['trend']}개 카테고리 · {counts['age']}개 연령대\n각 그룹을 하나 이상 선택하세요. ‘선택 저장’을 누르면 다음 실행에도 유지됩니다.")
+  ages=[name for name,var in self.collection_selection_vars["age"].items() if var.get()]
+  self.collection_selection_summary.set(f"3사 {counts['market']}개 카테고리 · 트렌드 {counts['trend']}개 카테고리\n연령대 {len(ages)}개: {', '.join(ages) or '선택 없음'} · 트렌드 수집처별 {counts['trend']*len(ages)}개 조합\n각 항목을 하나 이상 선택하세요. ‘선택 저장’을 누르면 다음 실행에도 유지됩니다.")
 
  def set_collection_selection(self,selected:bool) -> None:
   for values in self.collection_selection_vars.values():
@@ -1036,7 +1038,7 @@ class App(tk.Tk):
  def refresh_trend_products(self):
   if not hasattr(self,"trend_product_tree"):return
   for x in self.trend_product_tree.get_children():self.trend_product_tree.delete(x)
-  rows=trend_coupang_adapter.selected_rows();linked=0
+  rows=trend_coupang_adapter.selected_rows(self.collection_display_preferences);linked=0
   for r in rows:
    if int(r.get("product_id") or 0)>0:linked+=1
    self.trend_product_tree.insert("","end",values=(r.get("category"),r.get("keyword"),r.get("trend_sources"),r.get("coupang_name"),
@@ -1074,10 +1076,10 @@ class App(tk.Tk):
    con=sqlite3.connect(DB)
    try:raw_counts[source]=int(con.execute("SELECT COUNT(*) FROM trend_candidates WHERE source=?",(source,)).fetchone()[0])
    finally:con.close()
-   rows=trend_collection_adapter.merged_rows(source);merged_counts[source]=len(rows)
+   rows=trend_collection_adapter.merged_rows(source,self.collection_display_preferences);merged_counts[source]=len(rows)
    for r in rows:
     self.trend_tree.insert("","end",values=(r["source"],r["age_group"],r["category"],r["rank_no"],r["keyword"],r["age_rank"],r["captured_at"],r["status"]))
-  linked=len(trend_coupang_adapter.selected_rows())
+  linked=len(trend_coupang_adapter.selected_rows(self.collection_display_preferences))
   if hasattr(self,"collect_trend_summary"):
    self.collect_trend_summary.set(f"아이템스카우트 {merged_counts.get('아이템스카우트',0)} · 네이버 데이터랩 {merged_counts.get('네이버데이터랩',0)} · 쿠팡 연결 {linked}")
   self.trend_summary.set(
@@ -1107,7 +1109,7 @@ class App(tk.Tk):
   p=filedialog.asksaveasfilename(defaultextension=".csv",initialfile="itemscout_naver_datalab_age_trends_MERGED.csv")
   if not p:return
   rows=[]
-  for source in ("아이템스카우트","네이버데이터랩"):rows.extend(trend_collection_adapter.merged_rows(source))
+  for source in ("아이템스카우트","네이버데이터랩"):rows.extend(trend_collection_adapter.merged_rows(source,self.collection_display_preferences))
   with open(p,"w",newline="",encoding="utf-8-sig") as f:
    w=csv.writer(f);w.writerow(["수집처","연령그룹","연령코드","카테고리","통합순위","키워드","연령별순위","수집시각","페이지URL","상태"])
    for r in rows:w.writerow([r["source"],r["age_group"],r["age_codes"],r["category"],r["rank_no"],r["keyword"],r["age_rank"],r["captured_at"],r["page_url"],r["status"]])

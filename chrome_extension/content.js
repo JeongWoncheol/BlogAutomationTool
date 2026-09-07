@@ -1998,7 +1998,7 @@ async function trendSetAgeRangeTrusted(lo,hi,sec=trendRangeSection()){
   await trendWait(180);
   // Re-plan after every physical operation instead of building one static order.
   // If a wrong thumb ever reacts, the next iteration sees the newly committed
-  // pair and can still converge to the requested 20~30 or 40~60 range.
+  // pair and can still converge to the requested age range, including one decade.
   for(let stepNo=1;stepNo<=8;stepNo++){
     const state=trendCommittedOrRawAgePair(sec),pair=state.pair;
     if(pair.length>=2&&pair[0]===lo&&pair[1]===hi){
@@ -2218,8 +2218,34 @@ async function trendSetAgeRangeByGeometry(lo,hi,sec){
   }
   const v=await trendWaitAgeRange(lo,hi,sec,1100);return Object.assign({},v,{method:v.ok?"geometry_pointer_verified":"geometry_pointer_unverified",lo,hi,ops});
 }
+function trendAgeCodes(ageCodes){
+  if(!Array.isArray(ageCodes)||!ageCodes.length)return[];
+  const nums=ageCodes.map(Number);
+  if(nums.some(n=>![10,20,30,40,50,60].includes(n)))return[];
+  return [...new Set(nums)].sort((a,b)=>a-b);
+}
+function trendAgeCheckboxes(){
+  const controls=[...document.querySelectorAll("input[type='checkbox'],input[type='radio']")];
+  return [10,20,30,40,50,60].map(n=>({n,control:controls.find(c=>{
+    const label=trendLabelText(c).replace(/\s/g,'');
+    return label===`${n}대`||(n===60&&label==='60대이상');
+  })}));
+}
+function trendVerifyAgeChecks(nums){
+  const checks=trendAgeCheckboxes();
+  const actual=checks.filter(x=>x.control?.checked).map(x=>x.n);
+  return{ok:checks.every(x=>x.control&&Boolean(x.control.checked)===nums.includes(x.n)),method:"age_checks",actual,requested:nums};
+}
 async function trendSetAgeRange(ageCodes){
-  const nums=(ageCodes||[]).map(Number).filter(Number.isFinite);if(!nums.length)return{ok:false,method:"none"};
+  const nums=trendAgeCodes(ageCodes);if(!nums.length)return{ok:false,method:"invalid_age_codes"};
+  if(site()!=="아이템스카우트"){
+    for(const {n,control} of trendAgeCheckboxes()){
+      if(control&&Boolean(control.checked)!==nums.includes(n))try{control.click();}catch(_e){}
+    }
+    await trendWait(100);
+    return trendVerifyAgeChecks(nums);
+  }
+  if(nums.some((n,i)=>i>0&&n!==nums[i-1]+10))return{ok:false,method:"noncontiguous_age_range",requested:nums};
   const lo=Math.min(...nums),hi=Math.max(...nums),sec=trendRangeSection(),attempts=[];
   let pre=await trendWaitAgeRange(lo,hi,sec,260);if(pre.ok)return Object.assign(pre,{already:true,attempts});
 
@@ -2259,11 +2285,6 @@ async function trendSetAgeRange(ageCodes){
 
   const geo=await trendSetAgeRangeByGeometry(lo,hi,sec);attempts.push({phase:'geometry',geo});
   if(geo.ok)return Object.assign({},geo,{attempts});
-  // Checkbox fallback is for DataLab-like UIs only, not ItemScout's dual range.
-  if(site()!=="아이템스카우트"){
-    let hits=0;for(const n of [10,20,30,40,50,60]){const c=trendControlByText(`${n}대`);if(!c)continue;const desired=nums.includes(n);if(Boolean(c.checked)!==desired)try{c.click();}catch(_e){};if(desired&&c.checked)hits++;}
-    return{ok:hits===nums.length,method:"age_checks",lo,hi,hits,attempts};
-  }
   const final=trendVerifyAgeRange(lo,hi,sec);
   return{ok:false,method:"itemscout_dual_slider_not_verified",lo,hi,actual:final.values||[],snapshot:final.snapshot,attempts};
 }
@@ -2348,6 +2369,10 @@ async function collectItemScoutTrend(msg){
   await trendDismissItemScoutJoinPrompt(600);
   let cards=changed.cards?.length?changed.cards:extractTrendKeywords(msg.limit||30);
   if(cards.length<Number(msg.limit||30)){await trendWait(300);cards=extractTrendKeywords(msg.limit||30);}
+  const requestedAges=trendAgeCodes(msg.age_codes);
+  filter.age_after_apply=await trendWaitAgeRange(requestedAges[0],requestedAges.at(-1),trendRangeSection(),500);
+  if(!filter.age_after_apply.ok)return{status:"error",site:site(),url:location.href,cards:[],filter_state:filter,
+    error:"아이템스카우트 조회 후 연령대 선택이 달라져 수집 결과를 제외했습니다."};
   return{status:cards.length?"ok":"error",site:site(),url:location.href,cards:cards.slice(0,Number(msg.limit||30)),filter_state:filter,
     error:cards.length?"":"아이템스카우트 필터 적용 후 순위 키워드를 찾지 못했습니다.",
     debug:{collector:"itemscout_trusted_physical_dual_slider_v8_02",modal_blocked:false,fast_wait:true,body_head:trendNorm(document.body?.innerText||"").slice(0,1200)}};
@@ -2357,8 +2382,9 @@ function trendDateISO(d){return `${d.getFullYear()}-${String(d.getMonth()+1).pad
 async function naverDataLabDirectRanks(msg){
   if(location.hostname!=="datalab.naver.com")return{ok:false,error:"wrong_host"};
   const cid=String(msg.category_id||TREND_DATALAB_CIDS[msg.category_label||msg.query]||"");if(!cid)return{ok:false,error:"category_id_missing"};
+  const ages=trendAgeCodes(msg.age_codes);if(!ages.length)return{ok:false,error:"invalid_age_codes"};
   const end=new Date();end.setHours(12,0,0,0);end.setDate(end.getDate()-2);const start=new Date(end);start.setDate(start.getDate()-Math.max(1,Number(msg.period_days||30))+1);
-  const age=(msg.age_codes||[]).map(String).join(',');const gender=msg.gender&&msg.gender!=="전체"?(msg.gender==="여성"?'f':msg.gender==="남성"?'m':''):'';
+  const age=ages.join(',');const gender=msg.gender&&msg.gender!=="전체"?(msg.gender==="여성"?'f':msg.gender==="남성"?'m':''):'';
   const cards=[],seen=new Set(),limit=Math.max(1,Number(msg.limit||30));
   try{
     for(let page=1;page<=Math.ceil(limit/20);page++){
@@ -2384,9 +2410,14 @@ async function collectNaverDataLabTrend(msg){
   if(Number(msg.period_days||30)<=31){filter.period=trendClickExact(["1개월","최근 1개월","최근 30일"]);await trendWait(220);}
   if(msg.gender&&msg.gender!=="전체"){filter.gender=trendSetChecked(msg.gender,true)||trendClickExact(msg.gender);await trendWait(150);}else{filter.gender="전체";}
   filter.age=await trendSetAgeRange(msg.age_codes||[]);await trendWait(220);
+  if(!filter.age?.ok)return{status:"error",site:site(),url:location.href,cards:[],filter_state:filter,
+    error:"네이버 데이터랩에서 선택한 연령대만 적용됐는지 확인되지 않아 수집을 중단했습니다."};
   const before=extractTrendKeywords(30).slice(0,8).map(x=>x.keyword).join('|');filter.apply=trendClickExact(["조회하기","조회","적용"]);
   const changed=await trendWaitForKeywordChange(before,3200);let cards=changed.cards?.length?changed.cards:extractTrendKeywords(msg.limit||30);
   if(cards.length<Number(msg.limit||30)){window.scrollBy({top:Math.max(600,innerHeight*.75),behavior:"instant"});await trendWait(450);cards=extractTrendKeywords(msg.limit||30);}
+  filter.age_after_apply=trendVerifyAgeChecks(trendAgeCodes(msg.age_codes));
+  if(!filter.age_after_apply.ok)return{status:"error",site:site(),url:location.href,cards:[],filter_state:filter,
+    error:"네이버 데이터랩 조회 후 연령대 선택이 달라져 수집 결과를 제외했습니다."};
   return{status:cards.length?"ok":"error",site:site(),url:location.href,cards:cards.slice(0,Number(msg.limit||30)),filter_state:filter,aggregation_mode:"visible_ui_fallback",
     error:cards.length?"":"네이버 데이터랩 조건 적용 후 인기검색어 순위를 찾지 못했습니다.",
     debug:{collector:"naver_datalab_ui_fallback_v8_00",direct_error:direct.error||"",body_head:trendNorm(document.body?.innerText||"").slice(0,1200)}};
