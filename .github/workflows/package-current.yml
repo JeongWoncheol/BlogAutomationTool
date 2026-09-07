@@ -1,0 +1,33 @@
+name: Package current source
+
+on:
+  push:
+    branches:
+      - assistant/package-current
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python syntax check
+        run: python -m compileall -q app.py modules
+
+      - name: Build runnable source ZIP
+        run: |
+          mkdir -p dist/BlogAutomationTool_CURRENT
+          rsync -a --exclude='.git' --exclude='.github' --exclude='dist' ./ dist/BlogAutomationTool_CURRENT/
+          cd dist
+          zip -r BlogAutomationTool_CURRENT.zip BlogAutomationTool_CURRENT >/dev/null
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: BlogAutomationTool_CURRENT
+          path: dist/BlogAutomationTool_CURRENT.zip
+          if-no-files-found: error
